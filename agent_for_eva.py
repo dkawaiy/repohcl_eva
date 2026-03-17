@@ -5,8 +5,51 @@ import json
 import subprocess
 from typing import List, Dict, Any, Optional
 from prompts import SYSTEM_PROMPTS
-import openai
+from openai import OpenAI
 from dotenv import load_dotenv
+from loguru import logger
+
+llm_logger = logger.bind(channel="llm")
+
+
+def setup_logger(log_path: str = "logs/agent_for_eva.log") -> None:
+    os.makedirs(os.path.dirname(log_path) or ".", exist_ok=True)
+    llm_log_path = os.path.join(os.path.dirname(log_path) or ".", "llm.log")
+    logger.remove()
+    logger.add(
+        log_path,
+        level="INFO",
+        format="{time:YYYY-MM-DD HH:mm:ss} | {level} | {message}",
+        encoding="utf-8",
+        filter=lambda record: record["extra"].get("channel") != "llm",
+    )
+    logger.add(
+        llm_log_path,
+        level="INFO",
+        format="{time:YYYY-MM-DD HH:mm:ss} | {level} | {message}",
+        encoding="utf-8",
+        filter=lambda record: record["extra"].get("channel") == "llm",
+    )
+    logger.add(
+        lambda msg: print(msg, end=""),
+        level="INFO",
+        format="{time:YYYY-MM-DD HH:mm:ss} | {level} | {message}",
+        filter=lambda record: record["extra"].get("channel") != "llm",
+    )
+
+
+def _truncate_text(text: str, max_len: int = 4000) -> str:
+    if len(text) <= max_len:
+        return text
+    return text[:max_len] + "...<truncated>"
+
+
+def _format_messages_for_log(messages: List[Dict[str, Any]], max_len: int = 4000) -> str:
+    try:
+        dumped = json.dumps(messages, ensure_ascii=False)
+    except Exception:
+        dumped = str(messages)
+    return _truncate_text(dumped, max_len=max_len)
 
 # ==============================
 # 文档分块处理模块
@@ -145,8 +188,13 @@ class Retriever:
         embeddings = self.model.encode(texts, show_progress_bar=False).tolist()
         ids = [f"doc_{self.doc_id_counter + i}" for i in range(len(docs))]
         self.doc_id_counter += len(docs)
-        # 存储原始文档内容和元数据
-        metadatas = docs
+        # 扁平化元数据，保证只包含基本类型
+        metadatas = []
+        for doc in docs:
+            meta = {}
+            for k, v in doc.items():
+                meta[k] = str(v) if v is not None else ""
+            metadatas.append(meta)
         self.collection.add(
             documents=texts,
             embeddings=embeddings,
@@ -196,19 +244,43 @@ class ExecutionOperator:
     ) -> Dict[str, Any]:
         """使用 subprocess 运行命令并返回统一结构结果。"""
         use_shell = isinstance(command, str)
-        completed = subprocess.run(
+        logger.info(
+            "开始执行命令 | command={} | cwd={} | timeout={} | shell={}",
             command,
-            cwd=cwd,
-            timeout=timeout,
-            shell=use_shell,
-            text=True,
-            capture_output=True,
+            cwd,
+            timeout,
+            use_shell,
         )
-        return {
-            "returncode": completed.returncode,
-            "stdout": completed.stdout,
-            "stderr": completed.stderr,
-        }
+        try:
+            completed = subprocess.run(
+                command,
+                cwd=cwd,
+                timeout=timeout,
+                shell=use_shell,
+                text=True,
+                capture_output=True,
+            )
+            result = {
+                "returncode": completed.returncode,
+                "stdout": completed.stdout,
+                "stderr": completed.stderr,
+            }
+        except Exception as e:
+            logger.exception("命令执行异常")
+            result = {
+                "returncode": -1,
+                "stdout": "",
+                "stderr": f"Command execution error: {e}",
+            }
+        logger.info(
+            "命令执行完成 | returncode={} | stdout_len={} | stderr_len={} | stdout={} | stderr={}",
+            result["returncode"],
+            len(result["stdout"] or ""),
+            len(result["stderr"] or ""),
+            result["stdout"],
+            result["stderr"],
+        )
+        return result
 
     def write_code_and_run_command(
         self,
@@ -219,9 +291,24 @@ class ExecutionOperator:
         timeout: int = 120,
     ) -> str:
         """将代码写入指定路径并执行命令，返回执行结果。"""
-        os.makedirs(os.path.dirname(target_path) or ".", exist_ok=True)
-        with open(target_path, "w", encoding="utf-8") as f:
-            f.write(code)
+        logger.info("写入代码文件 | target_path={}", target_path)
+
+        try:
+            os.makedirs(os.path.dirname(target_path) or ".", exist_ok=True)
+            with open(target_path, "w", encoding="utf-8") as f:
+                f.write(code)
+        except Exception as e:
+            logger.exception("写入代码文件失败")
+            payload = {
+                "saved_path": target_path,
+                "command": command,
+                "cwd": cwd,
+                "returncode": -1,
+                "stdout": "",
+                "stderr": f"Write file error: {e}",
+            }
+            logger.info("工具执行结果 | payload={}", payload)
+            return json.dumps(payload, ensure_ascii=False)
 
         exec_result = self.run_command(command=command, cwd=cwd, timeout=timeout)
         payload = {
@@ -232,6 +319,7 @@ class ExecutionOperator:
             "stdout": exec_result.get("stdout", ""),
             "stderr": exec_result.get("stderr", ""),
         }
+        logger.info("工具执行结果 | payload={}", payload)
         return json.dumps(payload, ensure_ascii=False)
 
 
@@ -243,6 +331,7 @@ class SoftwareAgent:
         self.work_mode = work_mode
         self.retriever = Retriever()
         self.execution_operator = ExecutionOperator()
+        self.base_target_dir = "."
 
     def prepare_code_context(self, code_path: str):
         """加载并处理代码库"""
@@ -307,6 +396,7 @@ class SoftwareAgent:
 
     def execute_tool(self, tool_name: str, arguments: Dict[str, Any]) -> str:
         """执行本地工具 (Tool Execution)"""
+        logger.info("收到工具调用 | tool_name={} | arguments={}", tool_name, arguments)
         if tool_name == "search_knowledge":
             query = arguments.get("query", "")
             print(f"      -> 正在检索关键词: '{query}'")
@@ -318,6 +408,7 @@ class SoftwareAgent:
             output = ""
             for idx, res in enumerate(results, 1):
                 output += f"\n--- 结果 {idx} ({res.get('type')}) ---\n{res.get('content', '')[:300]}..."
+            logger.info("检索工具返回 | result_count={}", len(results))
             return output
         elif tool_name == "write_code_and_run_command":
             target_path = arguments.get("target_path")
@@ -331,54 +422,106 @@ class SoftwareAgent:
             if command is None:
                 return "Error: missing required argument 'command'."
 
+            # tool 中 target_path 只作为文件名，最终路径拼接到主流程 target_path 所在目录
+            file_name = os.path.basename(str(target_path))
+            final_target_path = os.path.join(self.base_target_dir, file_name)
+
+            normalized_command: Any = command
+            if isinstance(command, str):
+                cmd_text = command.strip()
+                if cmd_text.startswith("[") and cmd_text.endswith("]"):
+                    try:
+                        parsed = json.loads(cmd_text)
+                        if isinstance(parsed, list) and all(isinstance(x, str) for x in parsed):
+                            normalized_command = parsed
+                    except json.JSONDecodeError:
+                        normalized_command = command
+
+            # 约束命令必须执行刚写入的文件，避免模型传入 /tmp 等错误路径
+            if isinstance(normalized_command, list) and normalized_command:
+                if normalized_command[0].startswith("python"):
+                    if len(normalized_command) == 1:
+                        normalized_command.append(final_target_path)
+                    else:
+                        normalized_command[1] = final_target_path
+            elif isinstance(normalized_command, str):
+                cmd_text = normalized_command.strip()
+                if cmd_text.startswith("python") or cmd_text.startswith("python3"):
+                    normalized_command = f"python {final_target_path}"
+
             return self.execution_operator.write_code_and_run_command(
-                target_path=target_path,
+                target_path=final_target_path,
                 code=code,
-                command=command,
-                cwd=cwd,
+                command=normalized_command,
+                cwd=cwd or self.base_target_dir,
                 timeout=timeout,
             )
         else:
             return f"Error: Tool {tool_name} not found."
 
-    def invoke_llm(self, task_desc: str, initial_context: str = "") -> str:
+    def invoke_llm(self, task_desc: str, initial_context: str = "", code_path: str = "") -> str:
         """
         多轮对话代理的核心循环 (Agent Loop with Tool Calling)
-        通过 openai 协议调用本地/远程大模型，支持工具调用。
-        配置项通过 .env 文件控制（如 OPENAI_API_BASE, OPENAI_API_KEY, OPENAI_MODEL 等）。
+        兼容 openai>=1.0.0 新接口。
         """
-        # 加载 .env 配置
-
         load_dotenv()
-        openai.api_base = os.getenv("OPENAI_API_BASE", "http://localhost:8000/v1")
-        openai.api_key = os.getenv("OPENAI_API_KEY", "EMPTY")
-        model = os.getenv("OPENAI_MODEL", "gpt-3.5-turbo")
+        api_url = os.getenv("OPENAI_BASE_URL", "http://localhost:8000/v1")
+        api_key = os.getenv("OPENAI_API_KEY", "EMPTY")
+        model = os.getenv("MODEL", "gpt-3.5-turbo")
         try:
             temperature = float(os.getenv("OPENAI_TEMPERATURE", "0.2"))
         except Exception:
             temperature = 0.2
+        client = OpenAI(api_key=api_key, base_url=api_url)
+        logger.info(
+            "初始化LLM客户端 | base_url={} | model={} | temperature={}",
+            api_url,
+            model,
+            temperature,
+        )
 
         print(f"\n[*] 初始化大模型多轮推理代理引擎 (OpenAI协议, model={model}, temperature={temperature})...")
 
-        system_prompt = SYSTEM_PROMPTS.get(self.work_mode, "You are a helpful AI.")
+        system_prompt = SYSTEM_PROMPTS.get("default", "You are a helpful AI.") + SYSTEM_PROMPTS.get(self.work_mode, "You are a helpful AI.")
         messages = [{"role": "system", "content": system_prompt}]
 
         user_content = f"任务目标:\n{task_desc}"
+        if code_path:
+            user_content += (
+                f"\n\n[环境与路径说明]\n"
+                f"1. 你的基础代码目录(code_path)为: {code_path}\n"
+                f"2. 生成的新代码文件会被存放到独立的输出目录，但**执行该代码时的工作目录(cwd)会被设为基础目录 {code_path}**。\n"
+                f"3. 强烈建议：因此如果你要 import 基础目录里的模块，请在生成的代码首部显式添加 `import sys; sys.path.insert(0, '.')`，以避免 ModuleNotFoundError 找不到引用的问题。\n"
+            )
         if initial_context:
-            user_content += f"\n\n已提供的上下文信息(Whole Doc):\n{initial_context[:2000]}..."  # 演示截断
+            user_content += f"\n已提供的上下文信息(Whole Doc):\n{initial_context[:2000]}..."  # 演示截断
+
+        user_content += (
+            "\n\n执行约束:\n"
+            "1. 你可以参考的内容只有任务文本和 search_knowledge 返回结果。\n"
+            "2. 若需要落地代码，必须调用 write_code_and_run_command。\n"
+            "3. write_code_and_run_command 的 target_path 只传文件名，例如 demo.py。\n"
+            "4. command 必须执行该文件本身。"
+        )
 
         messages.append({"role": "user", "content": user_content})
 
-        max_turns = 4
+        max_turns = 20
+        token_prompt_total = 0
+        token_completion_total = 0
+        token_total = 0
         for turn in range(1, max_turns + 1):
             print(f"\n  [Loop Turn {turn}] 等待大模型响应...")
+            llm_logger.info(
+                "对话上下文(发送前) | turn={} | messages={}",
+                turn,
+                _format_messages_for_log(messages),
+            )
             try:
-                # 支持工具调用的 openai 协议（vllm/openai 兼容）
-                response = openai.ChatCompletion.create(
+                response = client.chat.completions.create(
                     model=model,
                     messages=messages,
                     temperature=temperature,
-                    stream=False,
                     tools=[
                         {
                             "type": "function",
@@ -404,14 +547,14 @@ class SoftwareAgent:
                                     "properties": {
                                         "target_path": {
                                             "type": "string",
-                                            "description": "代码写入的目标路径"
+                                            "description": "代码文件名（仅文件名，不要绝对路径），例如 demo.py"
                                         },
                                         "code": {
                                             "type": "string",
-                                            "description": "要写入文件的代码内容"
+                                            "description": "要写入文件的代码内容，只能包含可以直接运行的代码文本，不允许包含任何非代码的说明性文字。"
                                         },
                                         "command": {
-                                            "description": "执行命令，可为字符串或字符串数组",
+                                            "description": "用于执行该代码文件的命令。必须运行刚写入的同一文件。",
                                             "anyOf": [
                                                 {"type": "string"},
                                                 {
@@ -436,22 +579,58 @@ class SoftwareAgent:
                         }
                     ]
                 )
-                msg = response["choices"][0]["message"]
+                msg = response.choices[0].message
+                usage = getattr(response, "usage", None)
+                if usage is not None:
+                    prompt_tokens = int(getattr(usage, "prompt_tokens", 0) or 0)
+                    completion_tokens = int(getattr(usage, "completion_tokens", 0) or 0)
+                    total_tokens = int(getattr(usage, "total_tokens", 0) or 0)
+                    token_prompt_total += prompt_tokens
+                    token_completion_total += completion_tokens
+                    token_total += total_tokens
+                    logger.info(
+                        "LLM token使用 | turn={} | prompt={} | completion={} | total={}",
+                        turn,
+                        prompt_tokens,
+                        completion_tokens,
+                        total_tokens,
+                    )
+                llm_logger.info(
+                    "模型响应(原始) | turn={} | content={} | tool_calls={}",
+                    turn,
+                    _truncate_text(str(getattr(msg, "content", ""))),
+                    _truncate_text(str(getattr(msg, "tool_calls", None))),
+                )
             except Exception as e:
                 print(f"[!] LLM调用异常: {e}")
+                logger.exception("LLM调用异常")
                 return f"# Error: LLM调用异常: {e}"
 
             # 工具调用分支
-            if "tool_calls" in msg and msg["tool_calls"]:
+            if getattr(msg, "tool_calls", None):
+                assistant_tool_calls = []
+                for tc in msg.tool_calls:
+                    if hasattr(tc, "model_dump"):
+                        assistant_tool_calls.append(tc.model_dump())
+                    else:
+                        assistant_tool_calls.append({
+                            "id": getattr(tc, "id", ""),
+                            "type": "function",
+                            "function": {
+                                "name": getattr(getattr(tc, "function", None), "name", ""),
+                                "arguments": getattr(getattr(tc, "function", None), "arguments", "{}"),
+                            },
+                        })
+
                 messages.append({
                     "role": "assistant",
-                    "tool_calls": msg["tool_calls"],
-                    "content": None
+                    "tool_calls": assistant_tool_calls,
+                    "content": msg.content
                 })
-                for tool_call in msg["tool_calls"]:
-                    tool_name = tool_call["function"]["name"]
-                    tool_args = tool_call["function"].get("arguments", {})
-                    # openai协议下 arguments 可能是字符串需解析
+
+                for tool_call in msg.tool_calls:
+                    tool_name = tool_call.function.name
+                    tool_args = tool_call.function.arguments
                     if isinstance(tool_args, str):
                         try:
                             tool_args = json.loads(tool_args)
@@ -459,29 +638,52 @@ class SoftwareAgent:
                             tool_args = {}
 
                     print(f"    [LLM 动作]: 决定调用工具 -> {tool_name}({tool_args})")
+                    logger.info("模型决定调用工具 | tool_name={} | tool_args={}", tool_name, tool_args)
                     tool_result_str = self.execute_tool(tool_name, tool_args)
                     print(f"    [Tool 结果]: (已成功获取)")
+                    logger.info("工具返回结果 | tool_name={} | result={}", tool_name, tool_result_str)
                     # 工具结果回传 LLM
                     messages.append({
                         "role": "tool",
-                        "tool_call_id": tool_call["id"],
+                        "tool_call_id": tool_call.id,
                         "name": tool_name,
                         "content": tool_result_str
                     })
                 continue  # 工具调用后继续下一轮
 
             # 终态答案分支
-            if msg.get("content"):
+            if getattr(msg, "content", None):
                 print(f"    [LLM 动作]: 已收集充分信息，输出终态答案。")
-                messages.append({"role": "assistant", "content": msg["content"]})
-                return msg["content"]
+                logger.info(
+                    "LLM最终输出 | token汇总 prompt={} completion={} total={}",
+                    token_prompt_total,
+                    token_completion_total,
+                    token_total,
+                )
+                messages.append({"role": "assistant", "content": msg.content})
+                return msg.content
 
         print("[-] 达到最大Agent轮数限制。强制退出。")
+        logger.warning(
+            "达到最大轮数退出 | token汇总 prompt={} completion={} total={}",
+            token_prompt_total,
+            token_completion_total,
+            token_total,
+        )
         return "# Error: Exceeded max loop turns."
 
-    def run(self, task_path: str, doc_path: str, code_path: str, target_path: str):
+    def run(self, task_path: str, doc_path: str, code_path: str, target_path: str) -> bool:
         print(f"==== Agent 启动 ====")
         print(f"Work Mode: {self.work_mode}")
+        self.base_target_dir = os.path.abspath(os.path.dirname(target_path) or ".")
+        logger.info(
+            "Agent启动 | work_mode={} | task_path={} | doc_path={} | code_path={} | target_path={}",
+            self.work_mode,
+            task_path,
+            doc_path,
+            code_path,
+            target_path,
+        )
         
         if os.path.exists(task_path):
             with open(task_path, "r", encoding="utf-8") as f:
@@ -498,14 +700,27 @@ class SoftwareAgent:
             for doc in self.retriever.knowledge_base:
                 initial_context += f"{doc.get('content', '')}\n\n"
             
-        generated_code = self.invoke_llm(task_desc, initial_context=initial_context)
+        generated_code = self.invoke_llm(
+            task_desc, 
+            initial_context=initial_context,
+            code_path=code_path
+        )
+
+        if not generated_code or generated_code.startswith("# Error:"):
+            print("\n[!] 任务失败：LLM 未返回有效代码，已跳过目标文件写入。")
+            print(f"[!] 详细信息: {generated_code}")
+            logger.error("任务失败 | detail={}", generated_code)
+            return False
         
-        os.makedirs(os.path.dirname(target_path) or ".", exist_ok=True)
-        with open(target_path, "w", encoding="utf-8") as f:
-            f.write(generated_code)
-        print(f"\n[*] 任务完成，目标代码已导出至: {target_path}")
+        #os.makedirs(os.path.dirname(target_path) or ".", exist_ok=True)
+        #with open(target_path, "w", encoding="utf-8") as f:
+        #    f.write(generated_code)
+        #print(f"\n[*] 任务完成，目标代码已导出至: {target_path}")
+        logger.info("任务完成 | target_path={}", target_path)
+        return True
 
 if __name__ == "__main__":
+    setup_logger()
     parser = argparse.ArgumentParser(description="Evaluator Agent Core")
     parser.add_argument("--task_path", required=True, help="Path to task description file")
     parser.add_argument("--doc_path", required=True, help="Path to API/Spec documents")
@@ -521,9 +736,11 @@ if __name__ == "__main__":
     args = parser.parse_args()
     
     agent = SoftwareAgent(work_mode=args.work_mode)
-    agent.run(
+    ok = agent.run(
         task_path=args.task_path,
         doc_path=args.doc_path,
         code_path=args.code_path,
         target_path=args.target_path
     )
+    if not ok:
+        raise SystemExit(1)

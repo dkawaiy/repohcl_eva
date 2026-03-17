@@ -2,3 +2,8 @@ __pycache__
 *.pyc
 *.pyo
 .env
+.DS_Store
+/test_code
+/task
+/targets
+/logs
