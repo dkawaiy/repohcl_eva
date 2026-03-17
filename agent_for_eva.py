@@ -2,8 +2,51 @@ import os
 import ast
 import argparse
 import json
-from typing import List, Dict, Any
+import subprocess
+from typing import List, Dict, Any, Optional
 from prompts import SYSTEM_PROMPTS
+import openai
+from dotenv import load_dotenv
+
+# ==============================
+# 文档分块处理模块
+# ==============================
+class DocChunker:
+    @staticmethod
+    def split_markdown_chunks(md_text: str, file_path: str) -> list:
+        """
+        将 markdown 文本按 ### 标题分割为多个 chunk。
+        - 每个 chunk 以 '### ' 开头，包含该标题及其下属内容，直到下一个 '### ' 或文档结尾。
+        - 若文档没有任何 '###'，则整体作为一个 chunk。
+        - 每个 chunk 记录 type、title、content、file_path、order 等元信息。
+        """
+        import re
+        pattern = re.compile(r'(^### .*$)', re.MULTILINE)
+        matches = list(pattern.finditer(md_text))
+        chunks = []
+        for i, match in enumerate(matches):
+            start = match.start()
+            end = matches[i+1].start() if i+1 < len(matches) else len(md_text)
+            chunk_text = md_text[start:end].strip()
+            title = match.group(1).strip().lstrip('#').strip()  # 提取标题文本
+            chunks.append({
+                "type": "markdown_chunk",  # 标记为 markdown_chunk 类型
+                "title": title,             # 该 chunk 的标题（去除 #）
+                "content": chunk_text,      # chunk 的全部内容
+                "file_path": file_path,     # 来源文件路径
+                "order": i                  # 在当前文件中的顺序编号
+            })
+        # 若文档没有任何 '###'，整体作为一个 chunk
+        if not chunks and md_text.strip():
+            chunks.append({
+                "type": "markdown_chunk",
+                "title": None,
+                "content": md_text.strip(),
+                "file_path": file_path,
+                "order": 0
+            })
+        return chunks
+
 
 # ==============================
 # 代码和文档的分块与处理处理模块
@@ -24,48 +67,173 @@ class CodeChunker:
         return chunks
 
     @staticmethod
-    def chunk_complex(code_text: str) -> List[Dict[str, Any]]:
-        """基于AST树进行高级语义拆分（函数、类粒度）"""
+    def chunk_complex(code_text: str, file_path: str = None) -> List[Dict[str, Any]]:
+        """基于AST树进行高级语义拆分（函数、类粒度），并补全全局代码块，记录顺序"""
         chunks = []
         try:
             tree = ast.parse(code_text)
             lines = code_text.splitlines()
+            covered = [False] * len(lines)
+            order = 0
+            node_order = []  # (order, start, end, chunk_dict)
             for node in tree.body:
                 if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
                     start_lineno = node.lineno - 1
                     end_lineno = getattr(node, 'end_lineno', node.lineno)
                     content = "\n".join(lines[start_lineno:end_lineno])
-                    chunks.append({
+                    chunk = {
                         "type": "code_chunk_complex",
                         "name": node.name,
-                        "content": content
-                    })
+                        "content": content,
+                        "start_line": start_lineno + 1,
+                        "end_line": end_lineno,
+                        "file_path": file_path,
+                        "order": order
+                    }
+                    node_order.append((order, start_lineno, end_lineno, chunk))
+                    order += 1
+                    for i in range(start_lineno, end_lineno):
+                        if 0 <= i < len(covered):
+                            covered[i] = True
+            # 补全未被覆盖的全局代码
+            global_lines = [i for i, cov in enumerate(covered) if not cov]
+            if global_lines:
+                from itertools import groupby
+                from operator import itemgetter
+                for _, group in groupby(enumerate(global_lines), lambda x: x[0] - x[1]):
+                    group_list = list(map(itemgetter(1), group))
+                    start = group_list[0]
+                    end = group_list[-1] + 1
+                    content = "\n".join(lines[start:end])
+                    if content.strip():
+                        chunk = {
+                            "type": "code_chunk_global",
+                            "content": content,
+                            "start_line": start + 1,
+                            "end_line": end,
+                            "file_path": file_path,
+                            "order": order
+                        }
+                        node_order.append((order, start, end, chunk))
+                        order += 1
+            # 按order排序，保证顺序还原
+            node_order.sort(key=lambda x: x[0])
+            chunks = [item[3] for item in node_order]
         except SyntaxError:
             pass
         return chunks
 
 # ==============================
-# 模拟检索模块 (Embeddings / VectorStore)
+# 检索模块 (Embeddings / VectorStore)
 # ==============================
+from sentence_transformers import SentenceTransformer
+import chromadb
+from chromadb.config import Settings
+
 class Retriever:
-    def __init__(self):
-        self.knowledge_base = []
+    def __init__(self, persist_dir: str = ".chroma_store"):
+        self.model = SentenceTransformer("all-MiniLM-L6-v2")
+        self.chroma_client = chromadb.Client(Settings(
+            persist_directory=persist_dir,
+            anonymized_telemetry=False
+        ))
+        self.collection = self.chroma_client.get_or_create_collection("eva_docs")
+        self.doc_id_counter = 0
 
     def add_documents(self, docs: List[Dict[str, Any]]):
-        self.knowledge_base.extend(docs)
+        texts = [doc.get("content", "") for doc in docs]
+        embeddings = self.model.encode(texts, show_progress_bar=False).tolist()
+        ids = [f"doc_{self.doc_id_counter + i}" for i in range(len(docs))]
+        self.doc_id_counter += len(docs)
+        # 存储原始文档内容和元数据
+        metadatas = docs
+        self.collection.add(
+            documents=texts,
+            embeddings=embeddings,
+            ids=ids,
+            metadatas=metadatas
+        )
 
     def search(self, query: str, top_k: int = 3) -> List[Dict[str, Any]]:
-        """模拟向量检索(后期可替换为 Chroma/FAISS 等)"""
-        query_words = query.lower().split()
-        scored_docs = []
-        for doc in self.knowledge_base:
-            content = doc.get("content", "").lower()
-            score = sum(1 for w in query_words if w in content)
-            if score > 0:
-                scored_docs.append((score, doc))
-        
-        scored_docs.sort(key=lambda x: x[0], reverse=True)
-        return [doc for score, doc in scored_docs[:top_k]]
+        query_emb = self.model.encode([query], show_progress_bar=False).tolist()[0]
+        results = self.collection.query(
+            query_embeddings=[query_emb],
+            n_results=top_k
+        )
+        # 返回 metadatas（即原始 doc 信息）
+        return results.get("metadatas", [[]])[0] if results.get("metadatas") else []
+
+    # 根据文件路径和起止行号检索源码块
+    def fetch_row_data(self, file_path: str, start_line: int, end_line: int) -> list:
+        """
+        只根据文件路径和起止行号检索源码块。
+        :param file_path: 文件路径
+        :param start_line: 起始行号（1-based）
+        :param end_line: 结束行号（1-based）
+        :return: 匹配的文档列表
+        """
+        all_docs = self.collection.get()["metadatas"] if self.collection.count() > 0 else []
+        results = []
+        for doc in all_docs:
+            if doc.get("file_path") != file_path:
+                continue
+            chunk_start = doc.get("start_line", 0)
+            chunk_end = chunk_start + doc.get("content", "").count("\n")
+            # 判断是否有重叠
+            if chunk_start <= end_line and chunk_end >= start_line:
+                results.append(doc)
+        return results
+
+# ==============================
+# 执行操作模块
+# ==============================
+class ExecutionOperator:
+    def run_command(
+        self,
+        command: Any,
+        cwd: Optional[str] = None,
+        timeout: int = 120,
+    ) -> Dict[str, Any]:
+        """使用 subprocess 运行命令并返回统一结构结果。"""
+        use_shell = isinstance(command, str)
+        completed = subprocess.run(
+            command,
+            cwd=cwd,
+            timeout=timeout,
+            shell=use_shell,
+            text=True,
+            capture_output=True,
+        )
+        return {
+            "returncode": completed.returncode,
+            "stdout": completed.stdout,
+            "stderr": completed.stderr,
+        }
+
+    def write_code_and_run_command(
+        self,
+        target_path: str,
+        code: str,
+        command: Any,
+        cwd: Optional[str] = None,
+        timeout: int = 120,
+    ) -> str:
+        """将代码写入指定路径并执行命令，返回执行结果。"""
+        os.makedirs(os.path.dirname(target_path) or ".", exist_ok=True)
+        with open(target_path, "w", encoding="utf-8") as f:
+            f.write(code)
+
+        exec_result = self.run_command(command=command, cwd=cwd, timeout=timeout)
+        payload = {
+            "saved_path": target_path,
+            "command": command,
+            "cwd": cwd,
+            "returncode": exec_result.get("returncode", -1),
+            "stdout": exec_result.get("stdout", ""),
+            "stderr": exec_result.get("stderr", ""),
+        }
+        return json.dumps(payload, ensure_ascii=False)
+
 
 # ==============================
 # 代理核心：整合流工作流
@@ -74,6 +242,7 @@ class SoftwareAgent:
     def __init__(self, work_mode: str):
         self.work_mode = work_mode
         self.retriever = Retriever()
+        self.execution_operator = ExecutionOperator()
 
     def prepare_code_context(self, code_path: str):
         """加载并处理代码库"""
@@ -95,19 +264,46 @@ class SoftwareAgent:
             self.retriever.add_documents(chunks)
 
     def prepare_doc_context(self, doc_path: str):
-        """加载参考文档"""
+        """
+        加载 markdown 文档，将每个 ### 单元分 chunk，支持目录递归。
+        每个 chunk 记录标题、顺序、文件路径等信息，便于后续检索和结构化索引。
+        """
         if not os.path.exists(doc_path):
             print(f"[-] Doc path not found: {doc_path}")
             return
-        
-        if os.path.isfile(doc_path):
-            with open(doc_path, "r", encoding="utf-8") as f:
+
+        doc_chunks = []  # 存储所有分割后的文档块
+
+        def process_file(file_path):
+            """
+            处理单个 markdown 文件，将其分割为 chunk 并加入 doc_chunks。
+            只处理 .md 文件，其他类型跳过。
+            """
+            if not file_path.endswith('.md'):
+                return
+            with open(file_path, "r", encoding="utf-8") as f:
                 doc_text = f.read()
+            # 分割并收集 chunk
+            doc_chunks.extend(DocChunker.split_markdown_chunks(doc_text, file_path))
 
-            if self.work_mode == "repohcl_doc_augmentation":
-                pass # 执行文档跟代码结构增强逻辑
+        def walk_dir(base_path):
+            """
+            递归遍历目录，处理所有子目录和 .md 文件。
+            """
+            for entry in os.scandir(base_path):
+                if entry.is_file():
+                    process_file(entry.path)
+                elif entry.is_dir():
+                    walk_dir(entry.path)
 
-            self.retriever.add_documents([{"type": "doc", "content": doc_text}])
+        # 判断输入路径类型，分别处理单文件或目录
+        if os.path.isfile(doc_path):
+            process_file(doc_path)
+        elif os.path.isdir(doc_path):
+            walk_dir(doc_path)
+
+        # 将所有分割后的 chunk 加入向量库/检索器
+        self.retriever.add_documents(doc_chunks)
 
     def execute_tool(self, tool_name: str, arguments: Dict[str, Any]) -> str:
         """执行本地工具 (Tool Execution)"""
@@ -123,67 +319,162 @@ class SoftwareAgent:
             for idx, res in enumerate(results, 1):
                 output += f"\n--- 结果 {idx} ({res.get('type')}) ---\n{res.get('content', '')[:300]}..."
             return output
+        elif tool_name == "write_code_and_run_command":
+            target_path = arguments.get("target_path")
+            code = arguments.get("code", "")
+            command = arguments.get("command")
+            cwd = arguments.get("cwd")
+            timeout = int(arguments.get("timeout", 120))
+
+            if not target_path:
+                return "Error: missing required argument 'target_path'."
+            if command is None:
+                return "Error: missing required argument 'command'."
+
+            return self.execution_operator.write_code_and_run_command(
+                target_path=target_path,
+                code=code,
+                command=command,
+                cwd=cwd,
+                timeout=timeout,
+            )
         else:
             return f"Error: Tool {tool_name} not found."
 
     def invoke_llm(self, task_desc: str, initial_context: str = "") -> str:
-        """多轮对话代理的核心循环 (Agent Loop with Tool Calling)"""
-        print(f"\n[*] 初始化大模型多轮推理代理引擎...")
-        
+        """
+        多轮对话代理的核心循环 (Agent Loop with Tool Calling)
+        通过 openai 协议调用本地/远程大模型，支持工具调用。
+        配置项通过 .env 文件控制（如 OPENAI_API_BASE, OPENAI_API_KEY, OPENAI_MODEL 等）。
+        """
+        # 加载 .env 配置
+
+        load_dotenv()
+        openai.api_base = os.getenv("OPENAI_API_BASE", "http://localhost:8000/v1")
+        openai.api_key = os.getenv("OPENAI_API_KEY", "EMPTY")
+        model = os.getenv("OPENAI_MODEL", "gpt-3.5-turbo")
+        try:
+            temperature = float(os.getenv("OPENAI_TEMPERATURE", "0.2"))
+        except Exception:
+            temperature = 0.2
+
+        print(f"\n[*] 初始化大模型多轮推理代理引擎 (OpenAI协议, model={model}, temperature={temperature})...")
+
         system_prompt = SYSTEM_PROMPTS.get(self.work_mode, "You are a helpful AI.")
         messages = [{"role": "system", "content": system_prompt}]
-        
+
         user_content = f"任务目标:\n{task_desc}"
         if initial_context:
-            user_content += f"\n\n已提供的上下文信息(Whole Doc):\n{initial_context[:2000]}..." # 演示截断
-            
+            user_content += f"\n\n已提供的上下文信息(Whole Doc):\n{initial_context[:2000]}..."  # 演示截断
+
         messages.append({"role": "user", "content": user_content})
-        
+
         max_turns = 4
-        
         for turn in range(1, max_turns + 1):
-            print(f"\n  [Loop Turn {turn}] 正在等待大模型响应...")
-            
-            # --- 以下为模拟实际的模型调用 (例如 openai.chat.completions.create) ---
-            # 伪造逻辑:
-            # 如果不是 whole_doc，并且是第一/二轮，就假装模型想去搜一搜
-            if self.work_mode != "whole_doc" and turn < 3:
-                simulated_query = " ".join(task_desc.split()[:2]) or "query"
-                tool_call = {
-                    "name": "search_knowledge",
-                    "arguments": {"query": simulated_query}
-                }
-                print(f"    [LLM 动作]: 决定调用工具 -> {tool_call['name']}({tool_call['arguments']})")
-                
-                # 压入记录
+            print(f"\n  [Loop Turn {turn}] 等待大模型响应...")
+            try:
+                # 支持工具调用的 openai 协议（vllm/openai 兼容）
+                response = openai.ChatCompletion.create(
+                    model=model,
+                    messages=messages,
+                    temperature=temperature,
+                    stream=False,
+                    tools=[
+                        {
+                            "type": "function",
+                            "function": {
+                                "name": "search_knowledge",
+                                "description": "检索知识库中的相关代码或文档片段",
+                                "parameters": {
+                                    "type": "object",
+                                    "properties": {
+                                        "query": {"type": "string", "description": "检索关键词"}
+                                    },
+                                    "required": ["query"]
+                                }
+                            }
+                        },
+                        {
+                            "type": "function",
+                            "function": {
+                                "name": "write_code_and_run_command",
+                                "description": "将代码写入指定路径，并在指定工作目录执行命令，返回stdout/stderr/returncode。",
+                                "parameters": {
+                                    "type": "object",
+                                    "properties": {
+                                        "target_path": {
+                                            "type": "string",
+                                            "description": "代码写入的目标路径"
+                                        },
+                                        "code": {
+                                            "type": "string",
+                                            "description": "要写入文件的代码内容"
+                                        },
+                                        "command": {
+                                            "description": "执行命令，可为字符串或字符串数组",
+                                            "anyOf": [
+                                                {"type": "string"},
+                                                {
+                                                    "type": "array",
+                                                    "items": {"type": "string"}
+                                                }
+                                            ]
+                                        },
+                                        "cwd": {
+                                            "type": "string",
+                                            "description": "命令执行目录，可选"
+                                        },
+                                        "timeout": {
+                                            "type": "integer",
+                                            "description": "命令超时时间（秒）",
+                                            "default": 120
+                                        }
+                                    },
+                                    "required": ["target_path", "code", "command"]
+                                }
+                            }
+                        }
+                    ]
+                )
+                msg = response["choices"][0]["message"]
+            except Exception as e:
+                print(f"[!] LLM调用异常: {e}")
+                return f"# Error: LLM调用异常: {e}"
+
+            # 工具调用分支
+            if "tool_calls" in msg and msg["tool_calls"]:
                 messages.append({
                     "role": "assistant",
-                    "content": None,
-                    "tool_calls": [{"id": f"call_{turn}", "function": tool_call}]
+                    "tool_calls": msg["tool_calls"],
+                    "content": None
                 })
-                
-                # 本地执行工具 (Tool Exec)
-                tool_result_str = self.execute_tool(tool_call["name"], tool_call["arguments"])
-                print(f"    [Tool 结果]: (已成功获取)")
-                
-                # 结果回传大模型
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": f"call_{turn}",
-                    "name": tool_call["name"],
-                    "content": tool_result_str
-                })
-                # 重新跳回循环头，让 LLM 再次决策
-                continue
+                for tool_call in msg["tool_calls"]:
+                    tool_name = tool_call["function"]["name"]
+                    tool_args = tool_call["function"].get("arguments", {})
+                    # openai协议下 arguments 可能是字符串需解析
+                    if isinstance(tool_args, str):
+                        try:
+                            tool_args = json.loads(tool_args)
+                        except json.JSONDecodeError:
+                            tool_args = {}
 
-            else:
-                # 模拟模型输出最终答案阶段
-                print(f"    [LLM 动作]: 已收集充分信息，开始生成终态代码...")
-                simulated_code = f"# ==== Target Output generated by Agent ====\n"
-                simulated_code += f"# Task: {task_desc.strip()[:30]}...\n\n"
-                simulated_code += f"def generated_solution_{self.work_mode}():\n    pass\n"
-                messages.append({"role": "assistant", "content": simulated_code})
-                return simulated_code
+                    print(f"    [LLM 动作]: 决定调用工具 -> {tool_name}({tool_args})")
+                    tool_result_str = self.execute_tool(tool_name, tool_args)
+                    print(f"    [Tool 结果]: (已成功获取)")
+                    # 工具结果回传 LLM
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tool_call["id"],
+                        "name": tool_name,
+                        "content": tool_result_str
+                    })
+                continue  # 工具调用后继续下一轮
+
+            # 终态答案分支
+            if msg.get("content"):
+                print(f"    [LLM 动作]: 已收集充分信息，输出终态答案。")
+                messages.append({"role": "assistant", "content": msg["content"]})
+                return msg["content"]
 
         print("[-] 达到最大Agent轮数限制。强制退出。")
         return "# Error: Exceeded max loop turns."
