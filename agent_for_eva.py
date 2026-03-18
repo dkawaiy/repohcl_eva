@@ -559,17 +559,11 @@ class SoftwareAgent:
         )
         return overview
 
-    def _get_plan_from_llm(self, task_desc: str, codebase_overview: str) -> str:
+    def _get_plan_from_llm(self, client: OpenAI, model: str, task_desc: str, codebase_overview: str) -> Dict[str, Any]:
         """
-        第一阶段：调用 LLM 以获取解决任务的执行计划。
+        第一阶段：调用 LLM 以获取解决任务的执行计划，并返回 token 使用情况。
         """
         print("\n[Phase 1] 开始代码库分析与执行计划生成...")
-        load_dotenv()
-        api_url = os.getenv("OPENAI_BASE_URL", "http://localhost:8000/v1")
-        api_key = os.getenv("OPENAI_API_KEY", "EMPTY")
-        model = os.getenv("MODEL", "gpt-3.5-turbo")
-        client = OpenAI(api_key=api_key, base_url=api_url)
-
         system_prompt = SYSTEM_PROMPTS.get("planner", "You are a helpful AI.")
         user_content = (
             f"这是你需要分析的完整代码库：\n\n```python\n{codebase_overview}\n```\n\n"
@@ -588,13 +582,33 @@ class SoftwareAgent:
                 temperature=0.1,  # 低温以获取确定性计划
             )
             plan = response.choices[0].message.content
+            usage = getattr(response, "usage", None)
+            prompt_tokens = int(getattr(usage, "prompt_tokens", 0) or 0) if usage is not None else 0
+            completion_tokens = int(getattr(usage, "completion_tokens", 0) or 0) if usage is not None else 0
+            total_tokens = int(getattr(usage, "total_tokens", 0) or 0) if usage is not None else 0
             print(f"    -> LLM 已生成执行计划:\n{plan}")
-            logger.info("LLM生成执行计划 | plan={}", plan)
-            return plan
+            logger.info(
+                "LLM生成执行计划 | prompt={} | completion={} | total={} | plan={}",
+                prompt_tokens,
+                completion_tokens,
+                total_tokens,
+                plan,
+            )
+            return {
+                "plan": plan,
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": total_tokens,
+            }
         except Exception as e:
             print(f"[!] LLM在生成计划阶段异常: {e}")
             logger.exception("LLM在生成计划阶段异常")
-            return "无法生成执行计划，将直接尝试执行任务。"
+            return {
+                "plan": "无法生成执行计划，将直接尝试执行任务。",
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "total_tokens": 0,
+            }
 
     def invoke_llm(self, task_desc: str, initial_context: str = "", code_path: str = "") -> str:
         """
@@ -618,6 +632,29 @@ class SoftwareAgent:
         )
 
         print(f"\n[*] 初始化大模型多轮推理代理引擎 (OpenAI协议, model={model}, temperature={temperature})...")
+
+        max_turns = 50
+        token_prompt_total = 0
+        token_completion_total = 0
+        token_total = 0
+
+        # 将计划阶段内聚到 invoke_llm 中，统一计入 token 统计
+        if self.work_mode == "plan_and_execute":
+            codebase_overview = self._build_codebase_overview(code_path)
+            if codebase_overview:
+                plan_result = self._get_plan_from_llm(client, model, task_desc, codebase_overview)
+                task_desc = f"任务目标：\n{task_desc}\n\n我的执行计划：\n{plan_result.get('plan', '')}"
+                token_prompt_total += int(plan_result.get("prompt_tokens", 0) or 0)
+                token_completion_total += int(plan_result.get("completion_tokens", 0) or 0)
+                token_total += int(plan_result.get("total_tokens", 0) or 0)
+                logger.info(
+                    "计划阶段token累计 | prompt_total={} | completion_total={} | total={}",
+                    token_prompt_total,
+                    token_completion_total,
+                    token_total,
+                )
+            else:
+                print("[-] 未能构建代码库概览，将按常规模式执行。")
 
         system_prompt = SYSTEM_PROMPTS.get(self.work_mode, "You are a helpful AI.")
         if self.work_mode == "plan_and_execute":
@@ -650,10 +687,6 @@ class SoftwareAgent:
 
         messages.append({"role": "user", "content": user_content})
 
-        max_turns = 50
-        token_prompt_total = 0
-        token_completion_total = 0
-        token_total = 0
         for turn in range(1, max_turns + 1):
             print(f"\n  [Loop Turn {turn}] 等待大模型响应...")
             llm_logger.info(
@@ -837,15 +870,6 @@ class SoftwareAgent:
 
         self.prepare_code_context(code_path)
         self.prepare_doc_context(doc_path)
-        
-        # 新增：plan_and_execute 模式
-        if self.work_mode == "plan_and_execute":
-            codebase_overview = self._build_codebase_overview(code_path)
-            if codebase_overview:
-                plan = self._get_plan_from_llm(task_desc, codebase_overview)
-                task_desc = f"任务目标：\n{task_desc}\n\n我的执行计划：\n{plan}"
-            else:
-                print("[-] 未能构建代码库概览，将按常规模式执行。")
 
         # 对于 whole_doc，强制注入全量上下文给第一条用户 Prompt
         initial_context = ""

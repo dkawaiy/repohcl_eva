@@ -1,0 +1,6 @@
+openai
+dotenv
+loguru
+sentence-transformers
+chromadb
+requests
