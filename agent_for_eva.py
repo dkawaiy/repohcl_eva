@@ -459,6 +459,143 @@ class SoftwareAgent:
         else:
             return f"Error: Tool {tool_name} not found."
 
+    def _build_codebase_overview(
+        self,
+        code_path: str,
+        max_files: int = 60,
+        max_chars_per_file: int = 2000,
+        max_total_chars: int = 30000,
+        include_extensions: Optional[List[str]] = None,
+    ) -> str:
+        """
+        构建代码库概览文本，供 plan_and_execute 模式在第一阶段做整体分析。
+
+        - 支持文件或目录输入。
+        - 默认只抽取常见代码/配置文件，跳过缓存与依赖目录。
+        - 自动进行单文件与总量截断，避免 prompt 过大。
+        """
+        if not code_path or not os.path.exists(code_path):
+            logger.warning("构建代码库概览失败 | 路径不存在: {}", code_path)
+            return ""
+
+        exts = include_extensions or [
+            ".py", ".md", ".txt", ".json", ".yaml", ".yml",
+            ".toml", ".ini", ".cfg", ".sh",
+        ]
+        allowed_exts = {e.lower() for e in exts}
+        skip_dirs = {
+            ".git", ".hg", ".svn", "__pycache__", ".mypy_cache", ".pytest_cache",
+            ".venv", "venv", "env", "node_modules", "dist", "build", "logs",
+        }
+
+        file_list: List[str] = []
+        if os.path.isfile(code_path):
+            file_list = [os.path.abspath(code_path)]
+            root_dir = os.path.dirname(os.path.abspath(code_path)) or "."
+        else:
+            root_dir = os.path.abspath(code_path)
+            for cur_root, dirs, files in os.walk(root_dir):
+                dirs[:] = [d for d in dirs if d not in skip_dirs and not d.startswith(".")]
+                for name in files:
+                    if name.startswith("."):
+                        continue
+                    full_path = os.path.join(cur_root, name)
+                    if os.path.splitext(name)[1].lower() in allowed_exts:
+                        file_list.append(full_path)
+
+        file_list = sorted(file_list)
+        if not file_list:
+            logger.warning("构建代码库概览失败 | 未找到可读文件: {}", code_path)
+            return ""
+
+        selected_files = file_list[:max_files]
+        overview_parts: List[str] = []
+        total_chars = 0
+
+        header = (
+            f"Codebase Root: {os.path.abspath(code_path)}\n"
+            f"Collected Files: {len(selected_files)}/{len(file_list)}\n"
+            f"(max_files={max_files}, max_chars_per_file={max_chars_per_file}, max_total_chars={max_total_chars})\n"
+        )
+        overview_parts.append(header)
+        total_chars += len(header)
+
+        for idx, file_path in enumerate(selected_files, 1):
+            rel_path = os.path.relpath(file_path, root_dir)
+            try:
+                with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+                    content = f.read()
+            except Exception as e:
+                logger.warning("读取文件失败 | path={} | error={}", file_path, e)
+                content = f"# [ReadError] {e}"
+
+            line_count = content.count("\n") + (1 if content else 0)
+            trimmed = content
+            if len(trimmed) > max_chars_per_file:
+                trimmed = trimmed[:max_chars_per_file] + "\n...<truncated per file>"
+
+            block = (
+                f"\n===== File {idx}: {rel_path} (lines={line_count}, chars={len(content)}) =====\n"
+                f"{trimmed}\n"
+            )
+
+            if total_chars + len(block) > max_total_chars:
+                remaining = max_total_chars - total_chars
+                if remaining > 200:
+                    overview_parts.append(block[:remaining] + "\n...<truncated total>\n")
+                else:
+                    overview_parts.append("\n...<truncated total>\n")
+                break
+
+            overview_parts.append(block)
+            total_chars += len(block)
+
+        overview = "".join(overview_parts).strip()
+        logger.info(
+            "代码库概览构建完成 | code_path={} | files={} | chars={}",
+            code_path,
+            len(selected_files),
+            len(overview),
+        )
+        return overview
+
+    def _get_plan_from_llm(self, task_desc: str, codebase_overview: str) -> str:
+        """
+        第一阶段：调用 LLM 以获取解决任务的执行计划。
+        """
+        print("\n[Phase 1] 开始代码库分析与执行计划生成...")
+        load_dotenv()
+        api_url = os.getenv("OPENAI_BASE_URL", "http://localhost:8000/v1")
+        api_key = os.getenv("OPENAI_API_KEY", "EMPTY")
+        model = os.getenv("MODEL", "gpt-3.5-turbo")
+        client = OpenAI(api_key=api_key, base_url=api_url)
+
+        system_prompt = SYSTEM_PROMPTS.get("planner", "You are a helpful AI.")
+        user_content = (
+            f"这是你需要分析的完整代码库：\n\n```python\n{codebase_overview}\n```\n\n"
+            f"这是你需要完成的任务目标：\n{task_desc}"
+        )
+        
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_content}
+        ]
+
+        try:
+            response = client.chat.completions.create(
+                model=model,
+                messages=messages,
+                temperature=0.1,  # 低温以获取确定性计划
+            )
+            plan = response.choices[0].message.content
+            print(f"    -> LLM 已生成执行计划:\n{plan}")
+            logger.info("LLM生成执行计划 | plan={}", plan)
+            return plan
+        except Exception as e:
+            print(f"[!] LLM在生成计划阶段异常: {e}")
+            logger.exception("LLM在生成计划阶段异常")
+            return "无法生成执行计划，将直接尝试执行任务。"
+
     def invoke_llm(self, task_desc: str, initial_context: str = "", code_path: str = "") -> str:
         """
         多轮对话代理的核心循环 (Agent Loop with Tool Calling)
@@ -482,7 +619,11 @@ class SoftwareAgent:
 
         print(f"\n[*] 初始化大模型多轮推理代理引擎 (OpenAI协议, model={model}, temperature={temperature})...")
 
-        system_prompt = SYSTEM_PROMPTS.get("default", "You are a helpful AI.") + SYSTEM_PROMPTS.get(self.work_mode, "You are a helpful AI.")
+        system_prompt = SYSTEM_PROMPTS.get(self.work_mode, "You are a helpful AI.")
+        if self.work_mode == "plan_and_execute":
+            system_prompt = SYSTEM_PROMPTS.get("plan_and_execute", "You are a helpful AI.")
+        else:
+            system_prompt = SYSTEM_PROMPTS.get("default", "You are a helpful AI.") + SYSTEM_PROMPTS.get(self.work_mode, "You are a helpful AI.")
         messages = [{"role": "system", "content": system_prompt}]
 
         user_content = f"任务目标:\n{task_desc}"
@@ -501,12 +642,15 @@ class SoftwareAgent:
             "1. 你可以参考的内容只有任务文本和 search_knowledge 返回结果。\n"
             "2. 若需要落地代码，必须调用 write_code_and_run_command。\n"
             "3. write_code_and_run_command 的 target_path 只传文件名，例如 demo.py。\n"
-            "4. command 必须执行该文件本身。"
+            "4. command 必须执行该文件本身。\n"
+            # --- 新增 ---
+            "5. 当你的工具返回结果中 returncode 为 0，且跑通了要求的业务逻辑后，请直接以普通文本形式输出最终的代码文本，**不要再调用任何工具，以此结束对话**。\n"
+            "6. 忽略非致命的系统 stderr 警告（例如 urllib3 的 SSL 警告），如果只是一些不影响业务最终输出的警告，不要因此反复去修复和尝试。"
         )
 
         messages.append({"role": "user", "content": user_content})
 
-        max_turns = 20
+        max_turns = 50
         token_prompt_total = 0
         token_completion_total = 0
         token_total = 0
@@ -694,6 +838,15 @@ class SoftwareAgent:
         self.prepare_code_context(code_path)
         self.prepare_doc_context(doc_path)
         
+        # 新增：plan_and_execute 模式
+        if self.work_mode == "plan_and_execute":
+            codebase_overview = self._build_codebase_overview(code_path)
+            if codebase_overview:
+                plan = self._get_plan_from_llm(task_desc, codebase_overview)
+                task_desc = f"任务目标：\n{task_desc}\n\n我的执行计划：\n{plan}"
+            else:
+                print("[-] 未能构建代码库概览，将按常规模式执行。")
+
         # 对于 whole_doc，强制注入全量上下文给第一条用户 Prompt
         initial_context = ""
         if self.work_mode == "whole_doc":
@@ -728,7 +881,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--work_mode", 
         required=True, 
-        choices=["code_chunk_simple", "code_chunk_complex", "whole_doc", "repohcl_doc_augmentation"],
+        choices=["code_chunk_simple", "code_chunk_complex", "whole_doc", "repohcl_doc_augmentation", "plan_and_execute"],
         help="Strategy for RAG context extraction"
     )
     parser.add_argument("--target_path", required=True, help="Output path for the generated code")
