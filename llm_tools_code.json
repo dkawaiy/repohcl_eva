@@ -1,0 +1,221 @@
+{
+  "enable_tools": true,
+  "enabled_tool_names": [
+    "search_knowledge",
+    "write_code_file",
+    "delete_code_file",
+    "execute_predefined_command",
+    "get_project_structure",
+    "get_file_text"
+  ],
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "search_knowledge",
+        "description": "检索知识库中的相关代码片段",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "query": {
+              "type": "string",
+              "description": "检索关键词"
+            },
+            "top_k": {
+              "type": "integer",
+              "description": "返回结果数量，建议 3-12",
+              "default": 8,
+              "minimum": 1,
+              "maximum": 20
+            },
+            "level": {
+              "type": "string",
+              "description": "检索原始代码",
+              "enum": [
+                "chunk"
+              ],
+              "default": "chunk"
+            }
+          },
+          "required": [
+            "query"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "write_code_file",
+        "description": "将代码写入目标目录下的绝对路径文件。target_path 必须是绝对路径，且位于 target_base_dir 内。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "target_path": {
+              "type": "string",
+              "description": "绝对文件路径，例如 /data1/repohcl_eva/target_projects/thumbnailator/src/main/java/demo/ThumbnailDemo.java",
+              "pattern": "^/"
+            },
+            "code": {
+              "type": "string",
+              "description": "要写入文件的代码内容，只能包含可以直接运行的代码文本，不允许包含任何非代码的说明性文字。"
+            }
+          },
+          "required": [
+            "target_path",
+            "code"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "delete_code_file",
+        "description": "删除目标目录下的绝对路径文件，用于先删后写场景。target_path 必须位于 target_base_dir 内。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "target_path": {
+              "type": "string",
+              "description": "绝对文件路径，例如 /data1/repohcl_eva/target_projects/thumbnailator/src/main/java/demo/ThumbnailDemo.java",
+              "pattern": "^/"
+            }
+          },
+          "required": [
+            "target_path"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "execute_predefined_command",
+        "description": "按白名单 command_name 执行命令。命令主体不可自定义，只能传参数。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "command_name": {
+              "type": "string",
+              "description": "白名单命令名称，例如 run_python"
+            },
+            "args": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "传给白名单命令的额外参数"
+            },
+            "target_path": {
+              "type": "string",
+              "description": "绝对路径目标文件。当 command_name 需要 target_path 时必须提供，且必须位于 target_base_dir 内。",
+              "pattern": "^/"
+            },
+            "cwd": {
+              "type": "string",
+              "description": "执行目录。可选值：绝对路径，或 $TARGET_BASE_DIR，或 $CODE_PATH"
+            },
+            "timeout": {
+              "type": "integer",
+              "description": "命令超时时间（秒）",
+              "default": 120
+            }
+          },
+          "required": [
+            "command_name"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "get_project_structure",
+        "description": "获取目录结构；默认仅返回目录，按需可包含文件。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string",
+              "description": "绝对路径",
+              "pattern": "^/"
+            },
+            "scope": {
+              "type": "string",
+              "description": "路径作用域：target 或 code",
+              "enum": [
+                "target",
+                "code"
+              ],
+              "default": "target"
+            },
+            "max_depth": {
+              "type": "integer",
+              "description": "最大遍历层级，默认 4",
+              "default": 4
+            },
+            "max_entries": {
+              "type": "integer",
+              "description": "最大返回条目数，默认 200",
+              "default": 200
+            },
+            "include_hidden": {
+              "type": "boolean",
+              "description": "是否包含隐藏文件/目录",
+              "default": false
+            },
+            "include_files": {
+              "type": "boolean",
+              "description": "是否返回文件条目（默认仅返回目录）",
+              "default": false
+            }
+          }
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "get_file_text",
+        "description": "读取单个文本文件内容，可按行截取。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string",
+              "description": "文件绝对路径",
+              "pattern": "^/"
+            },
+            "scope": {
+              "type": "string",
+              "description": "路径作用域：target 或 code",
+              "enum": [
+                "target",
+                "code"
+              ],
+              "default": "target"
+            },
+            "start_line": {
+              "type": "integer",
+              "description": "起始行（1-based）",
+              "default": 1
+            },
+            "end_line": {
+              "type": "integer",
+              "description": "结束行（1-based，可选）"
+            },
+            "max_chars": {
+              "type": "integer",
+              "description": "最大返回字符数",
+              "default": 12000
+            }
+          },
+          "required": [
+            "path"
+          ]
+        }
+      }
+    }
+  ]
+}

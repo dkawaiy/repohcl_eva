@@ -1,0 +1,28 @@
+{
+  "allowed_commands": {
+    "run_build_thumbnailator": {
+      "command": ["docker", "exec", "-i", "test_env_demo1", "bash", "-lc", "cd /root/target_projects/thumbnailator && mvn -q compile exec:java"],
+      "append_target_path": false,
+      "allow_extra_args": false,
+      "description": "Build and run thumbnailator inside container"
+    },
+    "run_judge_thumbnailator": {
+      "command": ["python3", "/data1/repohcl_eva/judge_scripts/thumbnailator.py"],
+      "append_target_path": false,
+      "allow_extra_args": false,
+      "description": "Full judge: includes maven run + output validation"
+    },
+    "run_judge_thumbnailator_no_build": {
+      "command": ["python3", "/data1/repohcl_eva/judge_scripts/thumbnailator.py", "--skip-maven"],
+      "append_target_path": false,
+      "allow_extra_args": false,
+      "description": "Fast judge: skip maven and only validate generated output"
+    },
+    "docker_exec_test_env_demo1": {
+      "command": ["docker", "exec", "-i", "test_env_demo1", "bash", "-lc", "cd /root/target_projects/thumbnailator && mvn -q compile exec:java"],
+      "append_target_path": false,
+      "allow_extra_args": false,
+      "description": "(legacy alias) Build and run thumbnailator in container"
+    }
+  }
+}

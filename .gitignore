@@ -7,3 +7,9 @@ __pycache__
 /task
 /targets
 /logs
+env_py310
+/test_projects
+/tasks
+/target_projects
+/docs
+test_first_round_latency.py

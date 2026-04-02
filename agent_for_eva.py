@@ -96,7 +96,7 @@ class DocChunker:
 # ==============================
 class CodeChunker:
     @staticmethod
-    def chunk_simple(code_text: str, chunk_size: int = 50) -> List[Dict[str, Any]]:
+    def chunk_simple(code_text: str, chunk_size: int = 50, file_path: Optional[str] = None) -> List[Dict[str, Any]]:
         """按固定行数进行简单拆分"""
         lines = code_text.splitlines()
         chunks = []
@@ -105,7 +105,10 @@ class CodeChunker:
             chunks.append({
                 "type": "code_chunk_simple", 
                 "content": chunk, 
-                "start_line": i + 1
+                "start_line": i + 1,
+                "end_line": min(i + chunk_size, len(lines)),
+                "file_path": file_path,
+                "order": i // chunk_size,
             })
         return chunks
 
@@ -175,41 +178,181 @@ from chromadb.config import Settings
 
 class Retriever:
     def __init__(self, persist_dir: str = ".chroma_store"):
-        self.model = SentenceTransformer("all-MiniLM-L6-v2")
+        embedding_model_name = os.getenv("EMBEDDING_MODEL", "paraphrase-multilingual-MiniLM-L12-v2")
+        self.model = SentenceTransformer(embedding_model_name)
         self.chroma_client = chromadb.Client(Settings(
             persist_directory=persist_dir,
             anonymized_telemetry=False
         ))
-        self.collection = self.chroma_client.get_or_create_collection("eva_docs")
-        self.doc_id_counter = 0
+        self.collections = {
+            "chunk": self.chroma_client.get_or_create_collection("eva_docs_chunk"),
+            "symbol": self.chroma_client.get_or_create_collection("eva_docs_symbol"),
+            "module": self.chroma_client.get_or_create_collection("eva_docs_module"),
+            "repo": self.chroma_client.get_or_create_collection("eva_docs_repo"),
+        }
+        self.doc_id_counters = {"chunk": 0, "symbol": 0, "module": 0, "repo": 0}
+        logger.info("检索模型加载完成 | model={}", embedding_model_name)
 
-    def add_documents(self, docs: List[Dict[str, Any]]):
-        texts = [doc.get("content", "") for doc in docs]
+    def _normalize_meta(self, doc: Dict[str, Any], level: str) -> Dict[str, str]:
+        meta: Dict[str, str] = {"level": level}
+        for k, v in doc.items():
+            meta[k] = str(v) if v is not None else ""
+        return meta
+
+    def _add_to_collection(self, level: str, docs: List[Dict[str, Any]]):
+        if not docs:
+            return
+        texts = [str(doc.get("content", "")) for doc in docs if str(doc.get("content", "")).strip()]
+        if not texts:
+            return
+
+        filtered_docs = [doc for doc in docs if str(doc.get("content", "")).strip()]
         embeddings = self.model.encode(texts, show_progress_bar=False).tolist()
-        ids = [f"doc_{self.doc_id_counter + i}" for i in range(len(docs))]
-        self.doc_id_counter += len(docs)
-        # 扁平化元数据，保证只包含基本类型
-        metadatas = []
-        for doc in docs:
-            meta = {}
-            for k, v in doc.items():
-                meta[k] = str(v) if v is not None else ""
-            metadatas.append(meta)
-        self.collection.add(
+        start_id = self.doc_id_counters[level]
+        ids = [f"{level}_{start_id + i}" for i in range(len(filtered_docs))]
+        self.doc_id_counters[level] += len(filtered_docs)
+        metadatas = [self._normalize_meta(doc, level=level) for doc in filtered_docs]
+        self.collections[level].add(
             documents=texts,
             embeddings=embeddings,
             ids=ids,
-            metadatas=metadatas
+            metadatas=metadatas,
         )
 
-    def search(self, query: str, top_k: int = 3) -> List[Dict[str, Any]]:
-        query_emb = self.model.encode([query], show_progress_bar=False).tolist()[0]
-        results = self.collection.query(
+    def _build_symbol_docs(self, docs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        symbol_docs: List[Dict[str, Any]] = []
+        for doc in docs:
+            symbol_name = str(doc.get("name") or doc.get("title") or "").strip()
+            if not symbol_name:
+                continue
+            content = str(doc.get("content", ""))
+            symbol_docs.append({
+                "type": "symbol_summary",
+                "symbol_name": symbol_name,
+                "file_path": str(doc.get("file_path", "")),
+                "content": f"{symbol_name}\n{content[:1600]}",
+            })
+        return symbol_docs
+
+    def _build_module_docs(self, docs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        grouped: Dict[str, List[Dict[str, Any]]] = {}
+        for doc in docs:
+            file_path = str(doc.get("file_path") or "").strip()
+            if not file_path:
+                continue
+            grouped.setdefault(file_path, []).append(doc)
+
+        module_docs: List[Dict[str, Any]] = []
+        for file_path, items in grouped.items():
+            symbol_names = []
+            content_parts = []
+            for it in items[:8]:
+                name = str(it.get("name") or it.get("title") or "").strip()
+                if name:
+                    symbol_names.append(name)
+                content_parts.append(str(it.get("content", ""))[:500])
+            symbol_preview = ", ".join(symbol_names[:12])
+            merged = "\n".join(content_parts)[:2400]
+            module_docs.append({
+                "type": "module_summary",
+                "module_path": file_path,
+                "symbol_preview": symbol_preview,
+                "file_path": file_path,
+                "content": f"module={file_path}\nsymbols={symbol_preview}\n{merged}",
+            })
+        return module_docs
+
+    def _build_repo_doc(self, docs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        file_paths = sorted({str(doc.get("file_path") or "").strip() for doc in docs if str(doc.get("file_path") or "").strip()})
+        symbols = sorted({str(doc.get("name") or doc.get("title") or "").strip() for doc in docs if str(doc.get("name") or doc.get("title") or "").strip()})
+        if not file_paths and not symbols:
+            return []
+        repo_text = (
+            "repo_overview\n"
+            + "files:\n" + "\n".join(file_paths[:300])
+            + "\n\nsymbols:\n" + "\n".join(symbols[:500])
+        )[:5000]
+        return [{
+            "type": "repo_summary",
+            "file_path": "<repo>",
+            "content": repo_text,
+            "file_count": len(file_paths),
+            "symbol_count": len(symbols),
+        }]
+
+    def add_documents(self, docs: List[Dict[str, Any]]):
+        if not docs:
+            return
+        # 全量内容默认进入 chunk 层，保证兜底可召回。
+        self._add_to_collection("chunk", docs)
+
+        repo_hint_docs: List[Dict[str, Any]] = []
+        module_hint_docs: List[Dict[str, Any]] = []
+        symbol_hint_docs: List[Dict[str, Any]] = []
+        other_docs: List[Dict[str, Any]] = []
+
+        for doc in docs:
+            hinted_level = str(doc.get("doc_level") or "").strip().lower()
+            if hinted_level == "repo":
+                repo_hint_docs.append(doc)
+            elif hinted_level == "module":
+                module_hint_docs.append(doc)
+            elif hinted_level == "symbol":
+                symbol_hint_docs.append(doc)
+            else:
+                other_docs.append(doc)
+
+        # 若文档显式给出了层级，优先直接入对应层，减少二次总结损耗。
+        self._add_to_collection("repo", repo_hint_docs)
+        self._add_to_collection("module", module_hint_docs)
+        self._add_to_collection("symbol", symbol_hint_docs)
+
+        # 其余内容再走自动聚合构建。
+        self._add_to_collection("symbol", self._build_symbol_docs(other_docs))
+        self._add_to_collection("module", self._build_module_docs(other_docs))
+        self._add_to_collection("repo", self._build_repo_doc(other_docs))
+
+    def _query_level(self, query_emb: List[float], level: str, top_k: int) -> List[Dict[str, Any]]:
+        collection = self.collections.get(level)
+        if collection is None or collection.count() <= 0:
+            return []
+        n_results = max(1, min(int(top_k), 50))
+        results = collection.query(
             query_embeddings=[query_emb],
-            n_results=top_k
+            n_results=n_results,
         )
-        # 返回 metadatas（即原始 doc 信息）
         return results.get("metadatas", [[]])[0] if results.get("metadatas") else []
+
+    def search(self, query: str, top_k: int = 8, level: str = "auto") -> List[Dict[str, Any]]:
+        requested_level = str(level or "auto").strip().lower()
+        query_emb = self.model.encode([query], show_progress_bar=False).tolist()[0]
+        if requested_level in {"repo", "module", "symbol", "chunk"}:
+            return self._query_level(query_emb, requested_level, top_k)
+
+        # auto: 自上而下分层检索，优先返回高层概览，再补充细粒度片段。
+        merged: List[Dict[str, Any]] = []
+        merged.extend(self._query_level(query_emb, "repo", min(1, top_k)))
+        merged.extend(self._query_level(query_emb, "module", min(3, top_k)))
+        merged.extend(self._query_level(query_emb, "symbol", min(4, top_k)))
+        merged.extend(self._query_level(query_emb, "chunk", top_k))
+
+        dedup: List[Dict[str, Any]] = []
+        seen = set()
+        for item in merged:
+            key = (
+                str(item.get("level", "")),
+                str(item.get("file_path", "")),
+                str(item.get("module_path", "")),
+                str(item.get("symbol_name", "")),
+                str(item.get("name", "")),
+                str(item.get("title", "")),
+                str(item.get("start_line", "")),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            dedup.append(item)
+        return dedup[: max(1, min(top_k * 2, 40))]
 
     # 根据文件路径和起止行号检索源码块
     def fetch_row_data(self, file_path: str, start_line: int, end_line: int) -> list:
@@ -220,13 +363,17 @@ class Retriever:
         :param end_line: 结束行号（1-based）
         :return: 匹配的文档列表
         """
-        all_docs = self.collection.get()["metadatas"] if self.collection.count() > 0 else []
+        chunk_collection = self.collections.get("chunk")
+        all_docs = chunk_collection.get()["metadatas"] if chunk_collection and chunk_collection.count() > 0 else []
         results = []
         for doc in all_docs:
             if doc.get("file_path") != file_path:
                 continue
-            chunk_start = doc.get("start_line", 0)
-            chunk_end = chunk_start + doc.get("content", "").count("\n")
+            try:
+                chunk_start = int(doc.get("start_line", 0) or 0)
+            except Exception:
+                chunk_start = 0
+            chunk_end = chunk_start + str(doc.get("content", "")).count("\n")
             # 判断是否有重叠
             if chunk_start <= end_line and chunk_end >= start_line:
                 results.append(doc)
@@ -282,86 +429,717 @@ class ExecutionOperator:
         )
         return result
 
-    def write_code_and_run_command(
-        self,
-        target_path: str,
-        code: str,
-        command: Any,
-        cwd: Optional[str] = None,
-        timeout: int = 120,
-    ) -> str:
-        """将代码写入指定路径并执行命令，返回执行结果。"""
+    def write_code_file(self, target_path: str, code: str) -> Dict[str, Any]:
+        """仅将代码写入指定路径，返回统一结构结果。"""
         logger.info("写入代码文件 | target_path={}", target_path)
 
         try:
             os.makedirs(os.path.dirname(target_path) or ".", exist_ok=True)
             with open(target_path, "w", encoding="utf-8") as f:
                 f.write(code)
+            payload = {
+                "saved_path": target_path,
+                "ok": True,
+                "error": "",
+            }
         except Exception as e:
             logger.exception("写入代码文件失败")
             payload = {
                 "saved_path": target_path,
-                "command": command,
-                "cwd": cwd,
-                "returncode": -1,
-                "stdout": "",
-                "stderr": f"Write file error: {e}",
+                "ok": False,
+                "error": f"Write file error: {e}",
             }
-            logger.info("工具执行结果 | payload={}", payload)
-            return json.dumps(payload, ensure_ascii=False)
-
-        exec_result = self.run_command(command=command, cwd=cwd, timeout=timeout)
-        payload = {
-            "saved_path": target_path,
-            "command": command,
-            "cwd": cwd,
-            "returncode": exec_result.get("returncode", -1),
-            "stdout": exec_result.get("stdout", ""),
-            "stderr": exec_result.get("stderr", ""),
-        }
         logger.info("工具执行结果 | payload={}", payload)
-        return json.dumps(payload, ensure_ascii=False)
+        return payload
+
+    def delete_code_file(self, target_path: str) -> Dict[str, Any]:
+        """删除指定文件（仅文件），返回统一结构结果。"""
+        logger.info("删除代码文件 | target_path={}", target_path)
+        try:
+            if not os.path.exists(target_path):
+                payload = {
+                    "deleted_path": target_path,
+                    "ok": True,
+                    "error": "",
+                    "existed": False,
+                }
+            elif os.path.isdir(target_path):
+                payload = {
+                    "deleted_path": target_path,
+                    "ok": False,
+                    "error": "Delete file error: target is a directory.",
+                    "existed": True,
+                }
+            else:
+                os.remove(target_path)
+                payload = {
+                    "deleted_path": target_path,
+                    "ok": True,
+                    "error": "",
+                    "existed": True,
+                }
+        except Exception as e:
+            logger.exception("删除代码文件失败")
+            payload = {
+                "deleted_path": target_path,
+                "ok": False,
+                "error": f"Delete file error: {e}",
+                "existed": True,
+            }
+        logger.info("工具执行结果 | payload={}", payload)
+        return payload
 
 
 # ==============================
 # 代理核心：整合流工作流
 # ==============================
 class SoftwareAgent:
-    def __init__(self, work_mode: str):
+    def __init__(self, work_mode: str, project_root: str):
         self.work_mode = work_mode
-        self.retriever = Retriever()
+        self.project_root = os.path.abspath(project_root)
+        self.retriever = Retriever(persist_dir=os.path.join(self.project_root, ".chroma_store"))
         self.execution_operator = ExecutionOperator()
         self.base_target_dir = "."
+        self.base_code_dir = "."
+        self.command_policy_path = os.path.join(self.project_root, "command_whitelist.json")
+        self.command_policies = self._load_command_policies(self.command_policy_path)
+        self.command_policy_projects = self._load_command_policy_projects(self.command_policy_path)
+        self.active_command_policy: Dict[str, Any] = {}
+        self.active_allowed_command_names: Optional[set] = None
+
+        # 根据 work_mode 初始化 LLM 工具相关配置
+        if self.work_mode in ["code_chunk_simple", "code_chunk_complex", "plan_and_execute"]:
+            self.tools_config_path = os.path.join(self.project_root, "llm_tools_code.json")
+            llm_tools_config = self._load_llm_tools_config(self.tools_config_path)
+            self.llm_tools_enabled = llm_tools_config.get("enabled", True)
+            self.llm_tools = llm_tools_config.get("tools", [])
+        else:
+            self.tools_config_path = os.path.join(self.project_root, "llm_tools_doc.json")
+            llm_tools_config = self._load_llm_tools_config(self.tools_config_path)
+            self.llm_tools_enabled = llm_tools_config.get("enabled", True)
+            self.llm_tools = llm_tools_config.get("tools", [])
+        
+        self.file_edit_policy_path = os.path.join(self.project_root, "file_edit_whitelist.json")
+        self.file_edit_policies = self._load_file_edit_policies(self.file_edit_policy_path)
+        self.active_project_edit_policy: Dict[str, Any] = {}
+        self.search_query_counts: Dict[str, int] = {}
+        self.search_result_signature_cache: Dict[str, str] = {}
+        self.successful_write_count: int = 0
+        self.last_successful_write_path: Optional[str] = None
+        self.last_executed_command_name: Optional[str] = None
+        self.last_execute_write_count: int = 0
+
+    def _is_path_within(self, base_dir: str, target_path: str) -> bool:
+        base_abs = os.path.abspath(base_dir)
+        target_abs = os.path.abspath(target_path)
+        return target_abs == base_abs or target_abs.startswith(base_abs + os.sep)
+
+    def _require_absolute_path(self, path_value: Any, field_name: str) -> str:
+        text = str(path_value or "").strip()
+        if not text:
+            raise ValueError(f"{field_name} cannot be empty")
+        if not os.path.isabs(text):
+            raise ValueError(f"{field_name} must be an absolute path")
+        return os.path.abspath(text)
+
+    def _match_absolute_marker(self, marker: str, *paths: str) -> bool:
+        """按绝对路径 marker 匹配多个路径。"""
+        try:
+            marker_abs = self._require_absolute_path(marker, "match_paths marker")
+        except Exception:
+            return False
+
+        for p in paths:
+            p_abs = os.path.abspath(str(p or ""))
+            if p_abs == marker_abs:
+                return True
+            if self._is_path_within(marker_abs, p_abs):
+                return True
+            if self._is_path_within(p_abs, marker_abs):
+                return True
+        return False
+
+    def _load_command_policies(self, path: str) -> Dict[str, Dict[str, Any]]:
+        """加载命令白名单配置。"""
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+            policies = raw.get("allowed_commands", {}) if isinstance(raw, dict) else {}
+            if not isinstance(policies, dict):
+                logger.warning("命令白名单格式错误，已忽略 | path={}", path)
+                return {}
+            logger.info("命令白名单加载完成 | path={} | count={}", path, len(policies))
+            return policies
+        except FileNotFoundError:
+            logger.warning("命令白名单文件不存在 | path={}", path)
+            return {}
+        except Exception as e:
+            logger.exception("加载命令白名单失败 | path={} | error={}", path, e)
+            return {}
+
+    def _load_file_edit_policies(self, path: str) -> Dict[str, Any]:
+        """加载文件编辑白名单配置，支持顶层与 projects 两种格式。"""
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+            if not isinstance(raw, dict):
+                logger.warning("文件编辑白名单格式错误，已忽略 | path={}", path)
+                return {}
+
+            projects = raw.get("projects", {})
+            if projects and not isinstance(projects, dict):
+                logger.warning("文件编辑白名单 projects 字段格式错误，已忽略 | path={}", path)
+                return {}
+
+            top_target = raw.get("editable_files_under_target", [])
+            top_code = raw.get("editable_files_under_code", [])
+            if top_target and not isinstance(top_target, list):
+                logger.warning("文件编辑白名单 editable_files_under_target 格式错误，已忽略 | path={}", path)
+                return {}
+            if top_code and not isinstance(top_code, list):
+                logger.warning("文件编辑白名单 editable_files_under_code 格式错误，已忽略 | path={}", path)
+                return {}
+
+            logger.info(
+                "文件编辑白名单加载完成 | path={} | project_count={} | top_target_count={} | top_code_count={}",
+                path,
+                len(projects) if isinstance(projects, dict) else 0,
+                len(top_target) if isinstance(top_target, list) else 0,
+                len(top_code) if isinstance(top_code, list) else 0,
+            )
+            return raw
+        except FileNotFoundError:
+            logger.warning("文件编辑白名单文件不存在 | path={}", path)
+            return {}
+        except Exception as e:
+            logger.exception("加载文件编辑白名单失败 | path={} | error={}", path, e)
+            return {}
+
+    def _load_llm_tools_config(self, path: str) -> Dict[str, Any]:
+        """加载 LLM 工具定义配置。"""
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+
+            if isinstance(raw, dict):
+                enabled = bool(raw.get("enable_tools", True))
+                tools = raw.get("tools", [])
+                enabled_tool_names = raw.get("enabled_tool_names", [])
+            elif isinstance(raw, list):
+                enabled = True
+                tools = raw
+                enabled_tool_names = []
+            else:
+                logger.warning("LLM工具配置格式错误，已忽略 | path={}", path)
+                return {"enabled": True, "tools": []}
+
+            if not isinstance(tools, list):
+                logger.warning("LLM工具配置 tools 字段格式错误，已忽略 | path={}", path)
+                return {"enabled": enabled, "tools": []}
+
+            if not isinstance(enabled_tool_names, list):
+                enabled_tool_names = []
+
+            valid_tools: List[Dict[str, Any]] = [t for t in tools if isinstance(t, dict)]
+            if enabled_tool_names:
+                enabled_name_set = {
+                    str(x) for x in enabled_tool_names
+                    if isinstance(x, str) and str(x).strip()
+                }
+                valid_tools = [
+                    t for t in valid_tools
+                    if str(t.get("function", {}).get("name", "")) in enabled_name_set
+                ]
+            logger.info(
+                "LLM工具配置加载完成 | path={} | enabled={} | enabled_tool_names={} | count={}",
+                path,
+                enabled,
+                enabled_tool_names,
+                len(valid_tools),
+            )
+            return {"enabled": enabled, "tools": valid_tools}
+        except FileNotFoundError:
+            logger.warning("LLM工具配置文件不存在 | path={}", path)
+            return {"enabled": True, "tools": []}
+        except Exception as e:
+            logger.exception("加载LLM工具配置失败 | path={} | error={}", path, e)
+            return {"enabled": True, "tools": []}
+
+    def _load_command_policy_projects(self, path: str) -> Dict[str, Any]:
+        """加载项目级命令白名单配置。"""
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+            if not isinstance(raw, dict):
+                logger.warning("命令白名单 projects 格式错误，已忽略 | path={}", path)
+                return {}
+            projects = raw.get("projects", {})
+            if not isinstance(projects, dict):
+                logger.warning("命令白名单 projects 字段格式错误，已忽略 | path={}", path)
+                return {}
+            logger.info("命令白名单项目配置加载完成 | path={} | project_count={}", path, len(projects))
+            return projects
+        except FileNotFoundError:
+            logger.warning("命令白名单文件不存在(项目配置) | path={}", path)
+            return {}
+        except Exception as e:
+            logger.exception("加载命令白名单项目配置失败 | path={} | error={}", path, e)
+            return {}
+
+    def _select_command_policy(self, task_path: str, code_path: str) -> Dict[str, Any]:
+        """不再使用 match_paths，统一合并所有项目的 allowed_commands。"""
+        projects = self.command_policy_projects if isinstance(self.command_policy_projects, dict) else {}
+        if not projects:
+            logger.info("未配置项目级命令限制，使用 allowed_commands 全量命令")
+            return {}
+
+        merged_allowed: set = set()
+        for project_name, cfg in projects.items():
+            if not isinstance(cfg, dict):
+                continue
+            items = cfg.get("allowed_commands", [])
+            if not isinstance(items, list):
+                continue
+            for item in items:
+                if isinstance(item, str) and item in self.command_policies:
+                    merged_allowed.add(item)
+
+        if not merged_allowed:
+            logger.info("项目级命令限制为空，使用 allowed_commands 全量命令")
+            return {}
+
+        selected = {
+            "project_name": "ALL_PROJECTS",
+            "allowed_commands": sorted(merged_allowed),
+        }
+        logger.info("应用合并后的项目级命令白名单 | allowed_commands={}", selected["allowed_commands"])
+        return selected
+
+    def _get_effective_command_policies(self) -> Dict[str, Dict[str, Any]]:
+        """返回当前有效命令白名单（已应用项目级过滤）。"""
+        if not isinstance(self.command_policies, dict):
+            return {}
+        if not self.active_allowed_command_names:
+            return self.command_policies
+        return {
+            name: cfg
+            for name, cfg in self.command_policies.items()
+            if name in self.active_allowed_command_names
+        }
+
+    def _select_project_edit_policy(self, task_path: str, code_path: str, target_path: str) -> Dict[str, Any]:
+        """不再使用 match_paths，统一合并顶层与所有 projects 的可编辑文件列表。"""
+        if not isinstance(self.file_edit_policies, dict):
+            return {}
+
+        merged_target: List[str] = []
+        merged_code: List[str] = []
+
+        top_target = self.file_edit_policies.get("editable_files_under_target", [])
+        top_code = self.file_edit_policies.get("editable_files_under_code", [])
+        if isinstance(top_target, list):
+            merged_target.extend([str(x) for x in top_target if str(x).strip()])
+        if isinstance(top_code, list):
+            merged_code.extend([str(x) for x in top_code if str(x).strip()])
+
+        projects = self.file_edit_policies.get("projects", {})
+        if isinstance(projects, dict):
+            for _, cfg in projects.items():
+                if not isinstance(cfg, dict):
+                    continue
+                p_target = cfg.get("editable_files_under_target", [])
+                p_code = cfg.get("editable_files_under_code", [])
+                if isinstance(p_target, list):
+                    merged_target.extend([str(x) for x in p_target if str(x).strip()])
+                if isinstance(p_code, list):
+                    merged_code.extend([str(x) for x in p_code if str(x).strip()])
+
+        if not merged_target and not merged_code:
+            logger.info("未配置可编辑文件白名单")
+            return {}
+
+        selected = {
+            "project_name": "ALL_PROJECTS",
+            "editable_files_under_target": sorted(set(merged_target)),
+            "editable_files_under_code": sorted(set(merged_code)),
+        }
+        logger.info(
+            "应用合并后的文件编辑白名单 | target_count={} | code_count={}",
+            len(selected["editable_files_under_target"]),
+            len(selected["editable_files_under_code"]),
+        )
+        return selected
+
+    def _resolve_allowed_path(self, base_dir: str, configured_path: str) -> str:
+        """白名单路径统一要求为绝对路径。"""
+        _ = os.path.abspath(base_dir)
+        return self._require_absolute_path(configured_path, "whitelist path")
+
+    def _validate_editable_target(self, abs_target_path: str) -> Optional[str]:
+        """校验目标文件是否在当前项目可编辑白名单内。返回 None 表示允许。"""
+        policy = self.active_project_edit_policy
+        if not isinstance(policy, dict) or not policy:
+            return None
+
+        allow_under_target = policy.get("editable_files_under_target", [])
+        allow_under_code = policy.get("editable_files_under_code", [])
+        if not isinstance(allow_under_target, list):
+            allow_under_target = []
+        if not isinstance(allow_under_code, list):
+            allow_under_code = []
+
+        allowed_abs_paths = set()
+        for rel in allow_under_target:
+            try:
+                allowed_abs_paths.add(self._resolve_allowed_path(self.base_target_dir, str(rel)))
+            except Exception:
+                continue
+        for rel in allow_under_code:
+            try:
+                allowed_abs_paths.add(self._resolve_allowed_path(self.base_code_dir, str(rel)))
+            except Exception:
+                continue
+
+        norm_target = os.path.abspath(abs_target_path)
+        if norm_target in allowed_abs_paths:
+            return None
+
+        display_targets = sorted([os.path.relpath(p, self.base_code_dir) if p.startswith(os.path.abspath(self.base_code_dir)) else p for p in allowed_abs_paths])
+        return (
+            f"target file is not in editable whitelist for project "
+            f"'{policy.get('project_name', 'unknown')}'. allowed={display_targets}"
+        )
+
+    def _resolve_under_base_dir(self, target_path: str) -> str:
+        """要求绝对路径，并确保目标文件位于 target_base_dir 内。"""
+        resolved = self._require_absolute_path(target_path, "target_path")
+        base_dir = os.path.abspath(self.base_target_dir)
+        if not self._is_path_within(base_dir, resolved):
+            raise ValueError(f"Path escapes target dir: {target_path}")
+        return resolved
+
+    def _resolve_cwd(self, cwd: Optional[str]) -> str:
+        """解析命令执行目录。
+
+        支持：
+        - None / "" / "$TARGET_BASE_DIR": 目标项目目录
+        - "$CODE_PATH": 基础代码目录
+        - 其他输入：必须是绝对路径
+        """
+        if not cwd:
+            return os.path.abspath(self.base_target_dir)
+        cwd_text = str(cwd).strip()
+        if cwd_text == "$TARGET_BASE_DIR":
+            return os.path.abspath(self.base_target_dir)
+        if cwd_text == "$CODE_PATH":
+            return os.path.abspath(self.base_code_dir)
+        resolved = self._require_absolute_path(cwd_text, "cwd")
+        allowed_bases = [
+            os.path.abspath(self.project_root),
+            os.path.abspath(self.base_target_dir),
+            os.path.abspath(self.base_code_dir),
+        ]
+        if not any(self._is_path_within(base, resolved) for base in allowed_bases):
+            raise ValueError(
+                "cwd must be under project_root / target_base_dir / code_path"
+            )
+        return resolved
+
+    def _resolve_under_scope_dir(self, absolute_path: str, scope: str = "target") -> str:
+        """按作用域校验绝对路径，并确保不会逃逸到作用域目录外。"""
+        if scope == "target":
+            base_dir = os.path.abspath(self.base_target_dir)
+        elif scope == "code":
+            base_dir = os.path.abspath(self.base_code_dir)
+        else:
+            raise ValueError("scope must be 'target' or 'code'.")
+
+        resolved = self._require_absolute_path(absolute_path, "path")
+        if not self._is_path_within(base_dir, resolved):
+            raise ValueError(f"Path escapes {scope} dir: {absolute_path}")
+        return resolved
+
+    def _get_project_structure(
+        self,
+        path: str = "",
+        scope: str = "target",
+        max_depth: int = 4,
+        max_entries: int = 200,
+        include_hidden: bool = False,
+        include_files: bool = False,
+    ) -> Dict[str, Any]:
+        """获取目录结构，要求传入绝对路径。"""
+        start_path = self._resolve_under_scope_dir(path, scope=scope)
+        if not os.path.exists(start_path):
+            raise FileNotFoundError(f"Path not found: {path}")
+
+        payload: Dict[str, Any] = {
+            "scope": scope,
+            "input_path": path,
+            "resolved_path": start_path,
+            "include_files": include_files,
+            "entries": [],
+            "truncated": False,
+        }
+
+        if os.path.isfile(start_path):
+            payload["entries"].append({
+                "type": "file",
+                "path": os.path.basename(start_path),
+            })
+            return payload
+
+        entry_count = 0
+        for cur_root, dirs, files in os.walk(start_path):
+            rel_root = os.path.relpath(cur_root, start_path)
+            depth = 0 if rel_root == "." else rel_root.count(os.sep) + 1
+
+            if depth > max_depth:
+                dirs[:] = []
+                continue
+
+            if not include_hidden:
+                dirs[:] = [d for d in dirs if not d.startswith(".")]
+                files = [f for f in files if not f.startswith(".")]
+
+            dirs.sort()
+            files.sort()
+
+            for d in dirs:
+                rel_path = os.path.relpath(os.path.join(cur_root, d), start_path)
+                payload["entries"].append({"type": "dir", "path": rel_path})
+                entry_count += 1
+                if entry_count >= max_entries:
+                    payload["truncated"] = True
+                    return payload
+
+            if include_files:
+                for f in files:
+                    rel_path = os.path.relpath(os.path.join(cur_root, f), start_path)
+                    payload["entries"].append({"type": "file", "path": rel_path})
+                    entry_count += 1
+                    if entry_count >= max_entries:
+                        payload["truncated"] = True
+                        return payload
+
+        return payload
+
+    def _get_file_text(
+        self,
+        path: str,
+        scope: str = "target",
+        start_line: int = 1,
+        end_line: Optional[int] = None,
+        max_chars: int = 12000,
+    ) -> Dict[str, Any]:
+        """读取单个文件文本，要求传入绝对路径。"""
+        resolved_path = self._resolve_under_scope_dir(path, scope=scope)
+        if not os.path.isfile(resolved_path):
+            raise FileNotFoundError(f"File not found: {path}")
+
+        with open(resolved_path, "r", encoding="utf-8", errors="ignore") as f:
+            lines = f.readlines()
+
+        total_lines = len(lines)
+        safe_start = max(1, int(start_line or 1))
+        safe_end = total_lines if end_line is None else max(safe_start, int(end_line))
+        slice_lines = lines[safe_start - 1:safe_end]
+        content = "".join(slice_lines)
+        truncated = False
+        if len(content) > max_chars:
+            content = content[:max_chars] + "\n...<truncated>"
+            truncated = True
+
+        return {
+            "scope": scope,
+            "input_path": path,
+            "resolved_path": resolved_path,
+            "start_line": safe_start,
+            "end_line": safe_end,
+            "total_lines": total_lines,
+            "truncated": truncated,
+            "content": content,
+        }
+
+    def _build_command_from_policy(
+        self,
+        command_name: str,
+        args: Optional[List[str]],
+        target_path: Optional[str],
+    ) -> List[str]:
+        """根据白名单策略组装可执行命令。"""
+        effective_policies = self._get_effective_command_policies()
+        allowed_names = sorted(effective_policies.keys())
+        if self.active_allowed_command_names and command_name not in self.active_allowed_command_names:
+            raise ValueError(
+                f"Command not allowed for current task: {command_name}. "
+                f"Allowed command_name values: {allowed_names}"
+            )
+
+        policy = effective_policies.get(command_name)
+        if not isinstance(policy, dict):
+            raise ValueError(
+                f"Command not allowed: {command_name}. "
+                f"Allowed command_name values: {allowed_names}"
+            )
+
+        base_cmd = policy.get("command", [])
+        if not isinstance(base_cmd, list) or not all(isinstance(x, str) for x in base_cmd):
+            raise ValueError(f"Invalid policy command config: {command_name}")
+
+        allow_extra_args = bool(policy.get("allow_extra_args", True))
+        append_target_path = bool(policy.get("append_target_path", False))
+        args_mode = str(policy.get("args_mode", "passthrough") or "passthrough")
+
+        cmd = list(base_cmd)
+        if append_target_path:
+            if not target_path:
+                raise ValueError(f"Command requires target_path: {command_name}")
+            cmd.append(target_path)
+
+        if args is None:
+            args = []
+        if not isinstance(args, list) or not all(isinstance(x, str) for x in args):
+            raise ValueError("args must be a list of strings")
+        if args and not allow_extra_args:
+            raise ValueError(f"Extra args not allowed for command: {command_name}")
+
+        if args_mode == "shell_command":
+            # 兼容两种输入：[-c, "cmd..."] 或 ["cmd..."]，最终都归一为单个 shell 命令字符串。
+            normalized_args = list(args)
+            if normalized_args and normalized_args[0] == "-c":
+                normalized_args = normalized_args[1:]
+            if not normalized_args:
+                raise ValueError(f"Command requires shell command args: {command_name}")
+            shell_cmd = normalized_args[0] if len(normalized_args) == 1 else " ".join(normalized_args)
+            cmd.append(shell_cmd)
+        else:
+            cmd.extend(args)
+        return cmd
+
+    def _format_command_policy_for_prompt(self) -> str:
+        """将白名单命令格式化为 Prompt 可读文本。"""
+        effective_policies = self._get_effective_command_policies()
+        if not effective_policies:
+            return "(当前无可用白名单命令，请先配置 command_whitelist.json)"
+
+        lines = []
+        for name in sorted(effective_policies.keys()):
+            item = effective_policies.get(name, {})
+            base_cmd = item.get("command", [])
+            append_target_path = bool(item.get("append_target_path", False))
+            allow_extra_args = bool(item.get("allow_extra_args", True))
+            args_mode = str(item.get("args_mode", "passthrough") or "passthrough")
+            lines.append(
+                f"- {name}: base={base_cmd}, append_target_path={append_target_path}, allow_extra_args={allow_extra_args}, args_mode={args_mode}"
+            )
+        if isinstance(self.active_command_policy, dict) and self.active_command_policy:
+            lines.append(f"(active_command_policy={self.active_command_policy.get('project_name', 'unknown')})")
+        return "\n".join(lines)
+
+    def _format_file_edit_policy_for_prompt(self) -> str:
+        """将文件编辑白名单格式化为 Prompt 可读文本。"""
+        policy = self.active_project_edit_policy
+        if not isinstance(policy, dict) or not policy:
+            return "(当前未命中文件编辑白名单策略，写入将被拒绝)"
+
+        allow_under_target = policy.get("editable_files_under_target", [])
+        allow_under_code = policy.get("editable_files_under_code", [])
+        if not isinstance(allow_under_target, list):
+            allow_under_target = []
+        if not isinstance(allow_under_code, list):
+            allow_under_code = []
+
+        lines = [f"active_edit_policy={policy.get('project_name', 'unknown')}"]
+        lines.append(f"- editable_files_under_target: {allow_under_target}")
+        lines.append(f"- editable_files_under_code: {allow_under_code}")
+        return "\n".join(lines)
+
+    def _resolve_target_base_dir(self, target_path: str) -> str:
+        """将 target_path 解析为目标项目目录（非具体文件）。"""
+        abs_target = os.path.abspath(target_path)
+        if os.path.exists(abs_target) and os.path.isfile(abs_target):
+            raise ValueError(
+                f"target_path must be a project directory, got file path: {target_path}"
+            )
+        return abs_target
 
     def prepare_code_context(self, code_path: str):
         """加载并处理代码库"""
         if not os.path.exists(code_path):
             print(f"[-] Code path not found: {code_path}")
             return
-        
+
+        def _load_one_file(file_path: str) -> List[Dict[str, Any]]:
+            try:
+                with open(file_path, "r", encoding="utf-8") as f:
+                    code_text = f.read()
+            except Exception as e:
+                logger.warning("读取代码文件失败，已跳过 | path={} | error={}", file_path, e)
+                return []
+
+            if self.work_mode in ["code_chunk_simple", "repohcl_doc_augmentation"]:
+                return CodeChunker.chunk_simple(code_text, file_path=file_path)
+            if self.work_mode in ["code_chunk_complex"]:
+                return CodeChunker.chunk_complex(code_text, file_path=file_path)
+            return [{"type": "whole_code", "content": code_text, "file_path": file_path, "order": 0}]
+
+        chunk_count = 0
+        file_count = 0
+        allowed_exts = {
+            ".py", ".java", ".kt", ".scala", ".js", ".ts", ".tsx", ".jsx",
+            ".go", ".rs", ".cpp", ".cc", ".c", ".h", ".hpp", ".cs", ".php",
+            ".rb", ".swift", ".m", ".mm", ".sql", ".xml", ".yaml", ".yml", ".json"
+        }
+
         if os.path.isfile(code_path):
-            with open(code_path, "r", encoding="utf-8") as f:
-                code_text = f.read()
+            chunks = _load_one_file(code_path)
+            if chunks:
+                self.retriever.add_documents(chunks)
+                chunk_count += len(chunks)
+                file_count += 1
+        else:
+            for cur_root, dirs, files in os.walk(code_path):
+                dirs[:] = [d for d in dirs if not d.startswith(".") and d not in {"__pycache__", "node_modules", "build", "dist", ".git"}]
+                for filename in files:
+                    if filename.startswith("."):
+                        continue
+                    ext = os.path.splitext(filename)[1].lower()
+                    if ext not in allowed_exts:
+                        continue
+                    file_path = os.path.join(cur_root, filename)
+                    chunks = _load_one_file(file_path)
+                    if not chunks:
+                        continue
+                    self.retriever.add_documents(chunks)
+                    chunk_count += len(chunks)
+                    file_count += 1
 
-            if self.work_mode == "code_chunk_simple":
-                chunks = CodeChunker.chunk_simple(code_text)
-            elif self.work_mode in ["code_chunk_complex", "repohcl_doc_augmentation"]:
-                chunks = CodeChunker.chunk_complex(code_text)
-            else:
-                chunks = [{"type": "whole_code", "content": code_text}]
-                
-            self.retriever.add_documents(chunks)
+        logger.info("代码上下文加载完成 | code_path={} | file_count={} | chunk_count={}", code_path, file_count, chunk_count)
 
-    def prepare_doc_context(self, doc_path: str):
+    def prepare_doc_context(self, doc_path: str) -> int:
         """
         加载 markdown 文档，将每个 ### 单元分 chunk，支持目录递归。
         每个 chunk 记录标题、顺序、文件路径等信息，便于后续检索和结构化索引。
         """
         if not os.path.exists(doc_path):
             print(f"[-] Doc path not found: {doc_path}")
-            return
+            return 0
 
         doc_chunks = []  # 存储所有分割后的文档块
+
+        def infer_doc_level(file_path: str) -> str:
+            name = os.path.basename(file_path).lower()
+            path_text = file_path.lower()
+            if name.startswith("repo"):
+                return "repo"
+            if name.startswith("modules"):
+                return "module"
+            if name.endswith(".class.md") or name.endswith(".function.md"):
+                return "symbol"
+            if "/src/" in path_text:
+                return "symbol"
+            return "chunk"
 
         def process_file(file_path):
             """
@@ -373,7 +1151,11 @@ class SoftwareAgent:
             with open(file_path, "r", encoding="utf-8") as f:
                 doc_text = f.read()
             # 分割并收集 chunk
-            doc_chunks.extend(DocChunker.split_markdown_chunks(doc_text, file_path))
+            chunks = DocChunker.split_markdown_chunks(doc_text, file_path)
+            level = infer_doc_level(file_path)
+            for chunk in chunks:
+                chunk["doc_level"] = level
+            doc_chunks.extend(chunks)
 
         def walk_dir(base_path):
             """
@@ -390,72 +1172,222 @@ class SoftwareAgent:
             process_file(doc_path)
         elif os.path.isdir(doc_path):
             walk_dir(doc_path)
-
+        logger.info("文档分割完成 | doc_path={} | chunk_count={}", doc_path, len(doc_chunks))
         # 将所有分割后的 chunk 加入向量库/检索器
         self.retriever.add_documents(doc_chunks)
+        return len(doc_chunks)
 
     def execute_tool(self, tool_name: str, arguments: Dict[str, Any]) -> str:
         """执行本地工具 (Tool Execution)"""
         logger.info("收到工具调用 | tool_name={} | arguments={}", tool_name, arguments)
         if tool_name == "search_knowledge":
             query = arguments.get("query", "")
+            level = str(arguments.get("level", "auto") or "auto").strip().lower()
+            if level not in {"auto", "repo", "module", "symbol", "chunk"}:
+                level = "auto"
+            raw_top_k = arguments.get("top_k", 8)
+            try:
+                top_k = int(raw_top_k)
+            except Exception:
+                top_k = 8
+            top_k = max(1, min(top_k, 20))
             print(f"      -> 正在检索关键词: '{query}'")
-            results = self.retriever.search(query, top_k=3)
-            # 格式化检索结果供模型阅读
-            if not results:
-                return "没有找到相关的代码或文档信息。"
-            
-            output = ""
-            for idx, res in enumerate(results, 1):
-                output += f"\n--- 结果 {idx} ({res.get('type')}) ---\n{res.get('content', '')[:300]}..."
-            logger.info("检索工具返回 | result_count={}", len(results))
-            return output
-        elif tool_name == "write_code_and_run_command":
+            normalized_query = " ".join(str(query).lower().split())
+            query_key = f"{normalized_query}||level={level}"
+            repeat_count = self.search_query_counts.get(query_key, 0) + 1
+            self.search_query_counts[query_key] = repeat_count
+
+            results = self.retriever.search(query, top_k=top_k, level=level)
+            result_signature = json.dumps(results, ensure_ascii=False, sort_keys=True)
+            same_as_last = (self.search_result_signature_cache.get(query_key) == result_signature)
+            self.search_result_signature_cache[query_key] = result_signature
+
+            payload: Dict[str, Any] = {
+                "query": query,
+                "normalized_query": normalized_query,
+                "level": level,
+                "top_k": top_k,
+                "repeat_count": repeat_count,
+                "result_count": len(results),
+                "same_as_last": same_as_last,
+                "results": results,
+            }
+
+            if repeat_count >= 3 and same_as_last:
+                payload["warning"] = (
+                    "重复检索到相同结果。请停止重复 search_knowledge，改为基于当前结果直接写入代码或调用其他工具。"
+                )
+
+            logger.info(
+                "检索工具返回 | query={} | level={} | top_k={} | repeat_count={} | result_count={} | same_as_last={}",
+                normalized_query,
+                level,
+                top_k,
+                repeat_count,
+                len(results),
+                same_as_last,
+            )
+            return json.dumps(payload, ensure_ascii=False)
+        elif tool_name == "write_code_file":
             target_path = arguments.get("target_path")
             code = arguments.get("code", "")
-            command = arguments.get("command")
-            cwd = arguments.get("cwd")
-            timeout = int(arguments.get("timeout", 120))
 
             if not target_path:
                 return "Error: missing required argument 'target_path'."
-            if command is None:
-                return "Error: missing required argument 'command'."
 
-            # tool 中 target_path 只作为文件名，最终路径拼接到主流程 target_path 所在目录
-            file_name = os.path.basename(str(target_path))
-            final_target_path = os.path.join(self.base_target_dir, file_name)
+            try:
+                final_target_path = self._resolve_under_base_dir(str(target_path))
+            except Exception as e:
+                return f"Error: invalid target_path: {e}"
 
-            normalized_command: Any = command
-            if isinstance(command, str):
-                cmd_text = command.strip()
-                if cmd_text.startswith("[") and cmd_text.endswith("]"):
-                    try:
-                        parsed = json.loads(cmd_text)
-                        if isinstance(parsed, list) and all(isinstance(x, str) for x in parsed):
-                            normalized_command = parsed
-                    except json.JSONDecodeError:
-                        normalized_command = command
+            if not isinstance(self.active_project_edit_policy, dict) or not self.active_project_edit_policy:
+                return (
+                    "Error: write_code_file denied: no matched file edit whitelist policy (fail-closed). "
+                    f"target_base_dir={os.path.abspath(self.base_target_dir)}"
+                )
 
-            # 约束命令必须执行刚写入的文件，避免模型传入 /tmp 等错误路径
-            if isinstance(normalized_command, list) and normalized_command:
-                if normalized_command[0].startswith("python"):
-                    if len(normalized_command) == 1:
-                        normalized_command.append(final_target_path)
-                    else:
-                        normalized_command[1] = final_target_path
-            elif isinstance(normalized_command, str):
-                cmd_text = normalized_command.strip()
-                if cmd_text.startswith("python") or cmd_text.startswith("python3"):
-                    normalized_command = f"python {final_target_path}"
+            edit_err = self._validate_editable_target(final_target_path)
+            if edit_err:
+                return (
+                    f"Error: write_code_file denied: {edit_err}. "
+                    f"target_base_dir={os.path.abspath(self.base_target_dir)}"
+                )
 
-            return self.execution_operator.write_code_and_run_command(
+            payload = self.execution_operator.write_code_file(
                 target_path=final_target_path,
                 code=code,
-                command=normalized_command,
-                cwd=cwd or self.base_target_dir,
+            )
+            if bool(payload.get("ok", False)):
+                # 记录写入版本号，供执行门禁判断。
+                self.successful_write_count += 1
+                self.last_successful_write_path = final_target_path
+            payload["target_base_dir"] = os.path.abspath(self.base_target_dir)
+            payload["input_target_path"] = target_path
+            return json.dumps(payload, ensure_ascii=False)
+        elif tool_name == "delete_code_file":
+            target_path = arguments.get("target_path")
+            if not target_path:
+                return "Error: missing required argument 'target_path'."
+
+            try:
+                final_target_path = self._resolve_under_base_dir(str(target_path))
+            except Exception as e:
+                return f"Error: invalid target_path: {e}"
+
+            edit_err = self._validate_editable_target(final_target_path)
+            if edit_err:
+                return f"Error: delete_code_file denied: {edit_err}"
+
+            payload = self.execution_operator.delete_code_file(target_path=final_target_path)
+            payload["target_base_dir"] = os.path.abspath(self.base_target_dir)
+            payload["input_target_path"] = target_path
+            return json.dumps(payload, ensure_ascii=False)
+        elif tool_name == "execute_predefined_command":
+            if self.successful_write_count <= 0:
+                return (
+                    "Error: execute_predefined_command denied: must call write_code_file successfully "
+                    "before first command execution."
+                )
+
+            command_name = arguments.get("command_name")
+            args = arguments.get("args", [])
+            target_path = arguments.get("target_path")
+            cwd = arguments.get("cwd")
+            timeout = int(arguments.get("timeout", 120))
+
+            cmd_name_text = str(command_name or "").strip()
+            if not cmd_name_text:
+                return "Error: missing required argument 'command_name'."
+
+            # 禁止连续执行相同 command_name；若中间有成功写入则放行。
+            if (
+                self.last_executed_command_name == cmd_name_text
+                and self.successful_write_count <= self.last_execute_write_count
+            ):
+                return (
+                    "Error: execute_predefined_command denied: cannot execute the same command_name "
+                    "consecutively without a successful write_code_file in between."
+                )
+
+            resolved_target_path = None
+            if target_path:
+                try:
+                    resolved_target_path = self._resolve_under_base_dir(str(target_path))
+                except Exception as e:
+                    return f"Error: invalid target_path: {e}"
+
+            try:
+                resolved_cwd = self._resolve_cwd(cwd)
+            except Exception as e:
+                return f"Error: invalid cwd: {e}"
+
+            try:
+                command = self._build_command_from_policy(
+                    command_name=str(command_name),
+                    args=args,
+                    target_path=resolved_target_path,
+                )
+            except Exception as e:
+                return f"Error: command policy validation failed: {e}"
+
+            exec_result = self.execution_operator.run_command(
+                command=command,
+                cwd=resolved_cwd,
                 timeout=timeout,
             )
+            payload = {
+                "command_name": command_name,
+                "command": command,
+                "cwd": resolved_cwd,
+                "target_path": resolved_target_path,
+                "returncode": exec_result.get("returncode", -1),
+                "stdout": exec_result.get("stdout", ""),
+                "stderr": exec_result.get("stderr", ""),
+                "last_successful_write_path": self.last_successful_write_path,
+            }
+            self.last_executed_command_name = cmd_name_text
+            self.last_execute_write_count = self.successful_write_count
+            logger.info("工具执行结果 | payload={}", payload)
+            return json.dumps(payload, ensure_ascii=False)
+        elif tool_name == "get_project_structure":
+            try:
+                scope_value = str(arguments.get("scope", "target"))
+                if scope_value == "code":
+                    default_path = os.path.abspath(self.base_code_dir)
+                else:
+                    default_path = os.path.abspath(self.base_target_dir)
+                payload = self._get_project_structure(
+                    path=str(arguments.get("path", default_path)),
+                    scope=scope_value,
+                    max_depth=int(arguments.get("max_depth", 4)),
+                    max_entries=int(arguments.get("max_entries", 200)),
+                    include_hidden=bool(arguments.get("include_hidden", False)),
+                    include_files=bool(arguments.get("include_files", False)),
+                )
+                logger.info("项目结构工具执行结果 | entry_count={}", len(payload.get("entries", [])))
+                return json.dumps(payload, ensure_ascii=False)
+            except Exception as e:
+                logger.exception("项目结构工具执行失败")
+                return f"Error: get_project_structure failed: {e}"
+        elif tool_name == "get_file_text":
+            try:
+                payload = self._get_file_text(
+                    path=str(arguments.get("path", "")),
+                    scope=str(arguments.get("scope", "target")),
+                    start_line=int(arguments.get("start_line", 1)),
+                    end_line=arguments.get("end_line"),
+                    max_chars=int(arguments.get("max_chars", 12000)),
+                )
+                logger.info(
+                    "单文件读取工具执行结果 | path={} | lines={}-{}",
+                    payload.get("resolved_path", ""),
+                    payload.get("start_line", 1),
+                    payload.get("end_line", 1),
+                )
+                return json.dumps(payload, ensure_ascii=False)
+            except Exception as e:
+                logger.exception("单文件读取工具执行失败")
+                return f"Error: get_file_text failed: {e}"
         else:
             return f"Error: Tool {tool_name} not found."
 
@@ -637,7 +1569,6 @@ class SoftwareAgent:
         token_prompt_total = 0
         token_completion_total = 0
         token_total = 0
-
         # 将计划阶段内聚到 invoke_llm 中，统一计入 token 统计
         if self.work_mode == "plan_and_execute":
             codebase_overview = self._build_codebase_overview(code_path)
@@ -660,33 +1591,55 @@ class SoftwareAgent:
         if self.work_mode == "plan_and_execute":
             system_prompt = SYSTEM_PROMPTS.get("plan_and_execute", "You are a helpful AI.")
         else:
-            system_prompt = SYSTEM_PROMPTS.get("default", "You are a helpful AI.") + SYSTEM_PROMPTS.get(self.work_mode, "You are a helpful AI.")
+            system_prompt = (
+                SYSTEM_PROMPTS.get("default", "You are a helpful AI.")
+                + SYSTEM_PROMPTS.get(self.work_mode, "You are a helpful AI.")
+                + SYSTEM_PROMPTS.get("error_repair", "")
+            )
         messages = [{"role": "system", "content": system_prompt}]
 
         user_content = f"任务目标:\n{task_desc}"
+        command_policy_desc = self._format_command_policy_for_prompt()
+        file_edit_policy_desc = self._format_file_edit_policy_for_prompt()
         if code_path:
             user_content += (
                 f"\n\n[环境与路径说明]\n"
                 f"1. 你的基础代码目录(code_path)为: {code_path}\n"
-                f"2. 生成的新代码文件会被存放到独立的输出目录，但**执行该代码时的工作目录(cwd)会被设为基础目录 {code_path}**。\n"
-                f"3. 强烈建议：因此如果你要 import 基础目录里的模块，请在生成的代码首部显式添加 `import sys; sys.path.insert(0, '.')`，以避免 ModuleNotFoundError 找不到引用的问题。\n"
+                f"2. 你的目标项目目录(target_base_dir)为: {self.base_target_dir}\n"
+                f"3. write_code_file/delete_code_file 的 target_path 必须传绝对路径，且必须位于 target_base_dir 内。\n"
+                f"4. get_project_structure/get_file_text 的 path 也必须是绝对路径，并与 scope 保持一致。\n"
+                f"5. execute_predefined_command 的 cwd 规则：\n"
+                f"   - 不传或传 $TARGET_BASE_DIR：在目标项目目录执行\n"
+                f"   - 传 $CODE_PATH：在基础代码目录执行（适合依赖项目本体时）\n"
+                f"   - 其他情况必须传绝对路径，并且位于 project_root/target_base_dir/code_path 之内\n"
+                f"6. 当代码依赖项目模块时，优先在 $CODE_PATH 执行，或在代码首部添加 import sys; sys.path.insert(0, '{code_path}')。\n"
+                f"\n[命令白名单]\n{command_policy_desc}\n"
+                f"\n[文件编辑白名单]\n{file_edit_policy_desc}\n"
             )
         if initial_context:
             user_content += f"\n已提供的上下文信息(Whole Doc):\n{initial_context[:2000]}..."  # 演示截断
 
         user_content += (
             "\n\n执行约束:\n"
-            "1. 你可以参考的内容只有任务文本和 search_knowledge 返回结果。\n"
-            "2. 若需要落地代码，必须调用 write_code_and_run_command。\n"
-            "3. write_code_and_run_command 的 target_path 只传文件名，例如 demo.py。\n"
-            "4. command 必须执行该文件本身。\n"
-            # --- 新增 ---
-            "5. 当你的工具返回结果中 returncode 为 0，且跑通了要求的业务逻辑后，请直接以普通文本形式输出最终的代码文本，**不要再调用任何工具，以此结束对话**。\n"
-            "6. 忽略非致命的系统 stderr 警告（例如 urllib3 的 SSL 警告），如果只是一些不影响业务最终输出的警告，不要因此反复去修复和尝试。"
+            "1. 你可以参考任务文本、search_knowledge 返回结果，以及 get_project_structure/get_file_text 返回的上下文。\n"
+            "2. 若需要落地代码，必须先调用 write_code_file。\n"
+            "3. 若需先删后写，可调用 delete_code_file 删除目标文件后再 write_code_file。\n"
+            "4. 代码写入后，如需执行，必须调用 execute_predefined_command。\n"
+            "5. execute_predefined_command 只能使用白名单中的 command_name，不能直接传可执行命令文本。\n"
+            "6. command_name 只允许你补充参数 args；命令主体由系统白名单决定。\n"
+            "6.1 文件写入必须严格遵守文件编辑白名单：只能覆写白名单中的目标文件，禁止新建/修改任何其他文件。\n"
+            "7. 所有路径参数必须使用绝对路径；禁止相对路径与 ..。\n"
+            "8. 如需了解项目结构，可调用 get_project_structure（支持 target/code 两种作用域）。\n"
+            "9. 如需查看单文件内容，可调用 get_file_text（支持按行读取，避免一次性拉全量）。\n"
+            "10. Java 任务优先采用“写入 -> 执行”最短路径：先 write_code_file，再 execute_predefined_command，并优先在已配置好的项目目录执行。\n"
+            "11. 当工具返回 returncode 为 0，且业务逻辑已跑通，请直接输出最终代码文本，不要再调用工具。\n"
+            "12. 若 execute_predefined_command 返回失败，必须先基于报错做一次 search_knowledge(level=chunk) 精准检索，再改代码重试。\n"
+            "13. 忽略非致命 stderr 警告（例如 SSL warning），不要为不影响最终结果的警告反复重试。"
         )
 
         messages.append({"role": "user", "content": user_content})
 
+        messages_0 = messages
         for turn in range(1, max_turns + 1):
             print(f"\n  [Loop Turn {turn}] 等待大模型响应...")
             llm_logger.info(
@@ -695,66 +1648,16 @@ class SoftwareAgent:
                 _format_messages_for_log(messages),
             )
             try:
+                request_kwargs: Dict[str, Any] = {
+                    "model": model,
+                    "messages": messages,
+                    "temperature": temperature,
+                }
+                if self.llm_tools_enabled and self.llm_tools:
+                    request_kwargs["tools"] = self.llm_tools
+
                 response = client.chat.completions.create(
-                    model=model,
-                    messages=messages,
-                    temperature=temperature,
-                    tools=[
-                        {
-                            "type": "function",
-                            "function": {
-                                "name": "search_knowledge",
-                                "description": "检索知识库中的相关代码或文档片段",
-                                "parameters": {
-                                    "type": "object",
-                                    "properties": {
-                                        "query": {"type": "string", "description": "检索关键词"}
-                                    },
-                                    "required": ["query"]
-                                }
-                            }
-                        },
-                        {
-                            "type": "function",
-                            "function": {
-                                "name": "write_code_and_run_command",
-                                "description": "将代码写入指定路径，并在指定工作目录执行命令，返回stdout/stderr/returncode。",
-                                "parameters": {
-                                    "type": "object",
-                                    "properties": {
-                                        "target_path": {
-                                            "type": "string",
-                                            "description": "代码文件名（仅文件名，不要绝对路径），例如 demo.py"
-                                        },
-                                        "code": {
-                                            "type": "string",
-                                            "description": "要写入文件的代码内容，只能包含可以直接运行的代码文本，不允许包含任何非代码的说明性文字。"
-                                        },
-                                        "command": {
-                                            "description": "用于执行该代码文件的命令。必须运行刚写入的同一文件。",
-                                            "anyOf": [
-                                                {"type": "string"},
-                                                {
-                                                    "type": "array",
-                                                    "items": {"type": "string"}
-                                                }
-                                            ]
-                                        },
-                                        "cwd": {
-                                            "type": "string",
-                                            "description": "命令执行目录，可选"
-                                        },
-                                        "timeout": {
-                                            "type": "integer",
-                                            "description": "命令超时时间（秒）",
-                                            "default": 120
-                                        }
-                                    },
-                                    "required": ["target_path", "code", "command"]
-                                }
-                            }
-                        }
-                    ]
+                    **request_kwargs,
                 )
                 msg = response.choices[0].message
                 usage = getattr(response, "usage", None)
@@ -808,6 +1711,12 @@ class SoftwareAgent:
                 for tool_call in msg.tool_calls:
                     tool_name = tool_call.function.name
                     tool_args = tool_call.function.arguments
+
+                    if tool_name == 'write_code_file':
+                        messages = messages_0 + messages[2:]  # 重置对话上下文到初始状态，保留系统提示和用户任务描述
+                        print("    [Context Reset]: write_code_file 调用后已重置对话上下文，保留初始用户输入，清除之前的工具调用历史。")
+                        logger.info("write_code_file调用触发上下文重置 | turn={}", turn)
+                    
                     if isinstance(tool_args, str):
                         try:
                             tool_args = json.loads(tool_args)
@@ -819,6 +1728,7 @@ class SoftwareAgent:
                     tool_result_str = self.execute_tool(tool_name, tool_args)
                     print(f"    [Tool 结果]: (已成功获取)")
                     logger.info("工具返回结果 | tool_name={} | result={}", tool_name, tool_result_str)
+
                     # 工具结果回传 LLM
                     messages.append({
                         "role": "tool",
@@ -852,24 +1762,68 @@ class SoftwareAgent:
     def run(self, task_path: str, doc_path: str, code_path: str, target_path: str) -> bool:
         print(f"==== Agent 启动 ====")
         print(f"Work Mode: {self.work_mode}")
-        self.base_target_dir = os.path.abspath(os.path.dirname(target_path) or ".")
+        self.search_query_counts.clear()
+        self.search_result_signature_cache.clear()
+        self.successful_write_count = 0
+        self.last_successful_write_path = None
+        self.last_executed_command_name = None
+        self.last_execute_write_count = 0
+        try:
+            self.base_target_dir = self._resolve_target_base_dir(target_path)
+        except Exception as e:
+            print(f"[!] target_path 参数错误: {e}")
+            logger.error("target_path 参数错误 | target_path={} | error={}", target_path, e)
+            return False
+        self.base_code_dir = os.path.abspath(code_path) if code_path else os.path.abspath(self.project_root)
+        self.active_command_policy = self._select_command_policy(task_path, self.base_code_dir)
+        allowed_names = self.active_command_policy.get("allowed_commands", []) if isinstance(self.active_command_policy, dict) else []
+        if isinstance(allowed_names, list) and allowed_names:
+            self.active_allowed_command_names = {
+                str(x) for x in allowed_names
+                if isinstance(x, str) and x in self.command_policies
+            }
+            logger.info(
+                "应用项目级命令白名单 | project={} | allowed_commands={}",
+                self.active_command_policy.get("project_name", "unknown"),
+                sorted(self.active_allowed_command_names),
+            )
+        else:
+            self.active_allowed_command_names = None
+        self.active_project_edit_policy = self._select_project_edit_policy(
+            task_path=task_path,
+            code_path=self.base_code_dir,
+            target_path=self.base_target_dir,
+        )
+        os.makedirs(self.base_target_dir, exist_ok=True)
         logger.info(
-            "Agent启动 | work_mode={} | task_path={} | doc_path={} | code_path={} | target_path={}",
+            "Agent启动 | work_mode={} | task_path={} | doc_path={} | code_path={} | target_path={} | base_target_dir={} | base_code_dir={}",
             self.work_mode,
             task_path,
             doc_path,
             code_path,
             target_path,
+            self.base_target_dir,
+            self.base_code_dir,
         )
         
-        if os.path.exists(task_path):
-            with open(task_path, "r", encoding="utf-8") as f:
-                task_desc = f.read()
-        else:
-            task_desc = "Implement the module logic."
+        if not os.path.exists(task_path):
+            print(f"[!] task_path not found: {task_path}")
+            logger.error("task_path not found | task_path={}", task_path)
+            return False
+        with open(task_path, "r", encoding="utf-8") as f:
+            task_desc = f.read()
+
+        if not os.path.exists(doc_path):
+            print(f"[!] doc_path not found: {doc_path}")
+            logger.error("doc_path not found | doc_path={}", doc_path)
+            return False
 
         self.prepare_code_context(code_path)
-        self.prepare_doc_context(doc_path)
+        doc_chunk_count = self.prepare_doc_context(doc_path)
+        if doc_chunk_count <= 0:
+            print(f"[!] 文档上下文为空，无法进行文档检索: {doc_path}")
+            logger.error("文档上下文为空 | doc_path={}", doc_path)
+            return False
 
         # 对于 whole_doc，强制注入全量上下文给第一条用户 Prompt
         initial_context = ""
@@ -889,11 +1843,7 @@ class SoftwareAgent:
             logger.error("任务失败 | detail={}", generated_code)
             return False
         
-        #os.makedirs(os.path.dirname(target_path) or ".", exist_ok=True)
-        #with open(target_path, "w", encoding="utf-8") as f:
-        #    f.write(generated_code)
-        #print(f"\n[*] 任务完成，目标代码已导出至: {target_path}")
-        logger.info("任务完成 | target_path={}", target_path)
+        logger.info("任务完成 | target_base_dir={}", self.base_target_dir)
         return True
 
 if __name__ == "__main__":
@@ -908,16 +1858,32 @@ if __name__ == "__main__":
         choices=["code_chunk_simple", "code_chunk_complex", "whole_doc", "repohcl_doc_augmentation", "plan_and_execute"],
         help="Strategy for RAG context extraction"
     )
-    parser.add_argument("--target_path", required=True, help="Output path for the generated code")
-    
+    parser.add_argument(
+        "--target_path",
+        required=True,
+        help="Target project directory used as base path for write/delete operations",
+    )
+    parser.add_argument(
+        "--project_root",
+        default=".",
+        help="The absolute path to the root of the agent project.",
+    )
+
     args = parser.parse_args()
-    
-    agent = SoftwareAgent(work_mode=args.work_mode)
+
+    # Resolve all paths relative to the project root to ensure consistency
+    project_root_abs = os.path.abspath(args.project_root)
+    task_path_abs = os.path.abspath(os.path.join(project_root_abs, args.task_path))
+    doc_path_abs = os.path.abspath(os.path.join(project_root_abs, args.doc_path))
+    code_path_abs = os.path.abspath(os.path.join(project_root_abs, args.code_path))
+    target_path_abs = os.path.abspath(os.path.join(project_root_abs, args.target_path))
+
+    agent = SoftwareAgent(work_mode=args.work_mode, project_root=project_root_abs)
     ok = agent.run(
-        task_path=args.task_path,
-        doc_path=args.doc_path,
-        code_path=args.code_path,
-        target_path=args.target_path
+        task_path=task_path_abs,
+        doc_path=doc_path_abs,
+        code_path=code_path_abs,
+        target_path=target_path_abs
     )
     if not ok:
-        raise SystemExit(1)
+        exit(1)
